@@ -305,12 +305,29 @@ class FileMappingViewSet(viewsets.ModelViewSet):
         git_provider = self._get_git_provider(space)
         
         # Build tree with mappings
-        tree = FileMappingService.build_tree_with_mappings(
-            space=space,
-            git_provider=git_provider,
-            mode=mode,
-            filters=filters if filters else None
-        )
+        try:
+            tree = FileMappingService.build_tree_with_mappings(
+                space=space,
+                git_provider=git_provider,
+                mode=mode,
+                filters=filters if filters else None
+            )
+        except Exception as exc:
+            import requests as _requests
+            if isinstance(exc, _requests.exceptions.HTTPError) and exc.response is not None:
+                code = exc.response.status_code
+                if code == 401:
+                    return Response(
+                        {'error': 'Git provider authentication failed', 'code': 'GIT_PROVIDER_AUTH_FAILED',
+                         'detail': 'Git provider token is invalid or expired. Update it in Configuration → Tokens.'},
+                        status=status.HTTP_502_BAD_GATEWAY,
+                    )
+                if code == 403:
+                    return Response(
+                        {'error': 'Access forbidden', 'detail': 'Insufficient permissions for this repository.'},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+            raise
         
         return Response({'tree': tree})
     

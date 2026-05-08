@@ -29,6 +29,7 @@ class SpaceDetailSerializer(serializers.ModelSerializer):
             # Edit fork configuration
             'edit_fork_project_key', 'edit_fork_repo_slug', 'edit_fork_ssh_url',
             'edit_fork_local_path', 'edit_enabled',
+            'bot_usernames',
             'default_display_name_source', 'filters',
             'page_count',
             'created_by', 'created_by_username',

@@ -69,6 +69,8 @@ class EnrichmentRegistry:
     def get_all_enrichments(self, source_uri: str, user) -> Dict[str, List[Dict[str, Any]]]:
         """
         Get enrichments from all providers for a source URI.
+        Providers are called concurrently so fast ones (comments, edits) don't
+        wait behind slow ones (PR diffs that hit external APIs).
         
         Args:
             source_uri: Universal source address
@@ -77,20 +79,27 @@ class EnrichmentRegistry:
         Returns:
             Dictionary mapping enrichment types to lists of enrichments
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import logging
+        logger = logging.getLogger(__name__)
+
         result = {}
-        
-        for provider in self._providers:
+
+        def _call_provider(provider):
             enrichment_type = provider.get_enrichment_type()
             try:
                 enrichments = provider.get_enrichments(source_uri, user)
+                return enrichment_type, enrichments or []
+            except Exception as e:
+                logger.error(f"Error getting enrichments from {enrichment_type} provider: {e}", exc_info=True)
+                return enrichment_type, []
+
+        with ThreadPoolExecutor(max_workers=len(self._providers)) as pool:
+            futures = [pool.submit(_call_provider, p) for p in self._providers]
+            for fut in as_completed(futures):
+                enrichment_type, enrichments = fut.result()
                 if enrichments:
                     result[enrichment_type] = enrichments
-            except Exception as e:
-                # Log error but continue with other providers
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.error(f"Error getting enrichments from {enrichment_type} provider: {e}", exc_info=True)
-                result[enrichment_type] = []
         
         return result
     

@@ -130,6 +130,57 @@ class GitHubProvider(BaseGitProvider):
         prs = response.json()
         normalized = [self._normalize_pr(pr) for pr in prs]
 
+        # The /pulls list endpoint doesn't populate comment counts.
+        # Enrich from /issues which returns PRs with a `comments` field.
+        if normalized:
+            try:
+                issues_resp = self._request('GET', f'/repos/{repo_id}/issues', params={
+                    'state': state if state != 'merged' else 'closed',
+                    'per_page': per_page,
+                    'page': page,
+                })
+                comment_map = {
+                    issue['number']: issue.get('comments', 0)
+                    for issue in issues_resp.json()
+                    if 'pull_request' in issue
+                }
+                for pr in normalized:
+                    pr['comment_count'] = comment_map.get(pr['number'], pr.get('comment_count', 0))
+            except Exception:
+                pass  # Non-critical — keep whatever _normalize_pr produced
+
+        # The list endpoint never includes `mergeable`; fetch from the detail
+        # endpoint concurrently so we can populate merge_status.
+        if normalized:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def _fetch_merge_status(pr):
+                try:
+                    detail = self._request('GET', f'/repos/{repo_id}/pulls/{pr["number"]}').json()
+                    return pr['number'], detail.get('mergeable'), detail.get('draft', False)
+                except Exception:
+                    return pr['number'], None, None
+
+            merge_map: dict = {}
+            max_w = min(5, len(normalized))
+            with ThreadPoolExecutor(max_workers=max_w) as pool:
+                futs = [pool.submit(_fetch_merge_status, pr) for pr in normalized]
+                for fut in as_completed(futs):
+                    num, mergeable, draft = fut.result()
+                    if mergeable is not None or draft is not None:
+                        merge_map[num] = (mergeable, draft)
+
+            for pr in normalized:
+                info = merge_map.get(pr['number'])
+                if info:
+                    mergeable, draft = info
+                    if draft:
+                        pr['merge_status'] = 'draft'
+                    elif mergeable is True:
+                        pr['merge_status'] = 'clean'
+                    elif mergeable is False:
+                        pr['merge_status'] = 'conflict'
+
         if reviewer:
             reviewer_lower = reviewer.lower()
             normalized = [
@@ -151,9 +202,6 @@ class GitHubProvider(BaseGitProvider):
     def get_pull_request_diff(self, repo_id: str, pr_number: int) -> str:
         """Get pull request diff."""
         headers = {**self.headers, 'Accept': 'application/vnd.github.v3.diff'}
-        response = self._request('GET', f'/repos/{repo_id}/pulls/{pr_number}')
-        
-        # Get diff via separate request
         diff_response = requests.get(
             f"{self.base_url}/repos/{repo_id}/pulls/{pr_number}",
             headers=headers
@@ -161,6 +209,43 @@ class GitHubProvider(BaseGitProvider):
         diff_response.raise_for_status()
         return diff_response.text
     
+    def get_pr_comment_authors(self, repo_id: str, pr_number: int) -> List[str]:
+        """Return author usernames for all comments on a GitHub PR."""
+        authors: List[str] = []
+
+        def _paginate(endpoint: str):
+            """Fetch all pages for a GitHub list endpoint."""
+            url = endpoint
+            params = {'per_page': 100}
+            while url:
+                try:
+                    resp = self._request('GET', url, params=params)
+                    for c in resp.json():
+                        login = (c.get('user') or {}).get('login', '')
+                        if login:
+                            authors.append(login)
+                    # Follow Link: <...>; rel="next" header for subsequent pages
+                    next_url = None
+                    link_header = resp.headers.get('Link', '')
+                    for part in link_header.split(','):
+                        if 'rel="next"' in part:
+                            next_url = part.split(';')[0].strip().strip('<>')
+                            break
+                    if next_url:
+                        # next_url is absolute; strip base_url so _request can prepend it
+                        url = next_url.replace(self.base_url, '')
+                        params = {}  # params are already embedded in next_url
+                    else:
+                        url = None
+                except Exception:
+                    break
+
+        # Issue comments (conversation-level)
+        _paginate(f'/repos/{repo_id}/issues/{pr_number}/comments')
+        # Review comments (inline on diff)
+        _paginate(f'/repos/{repo_id}/pulls/{pr_number}/comments')
+        return authors
+
     def list_commits(self, repo_id: str, branch: str = 'main', page: int = 1, per_page: int = 30) -> Dict[str, Any]:
         """List commits."""
         response = self._request('GET', f'/repos/{repo_id}/commits', params={
@@ -216,6 +301,22 @@ class GitHubProvider(BaseGitProvider):
                 'role': 'REVIEWER',
                 'status': 'UNAPPROVED',
             })
+        comment_count = (pr.get('comments', 0) or 0) + (pr.get('review_comments', 0) or 0)
+
+        # merge_status: 'clean' | 'conflict' | 'unknown' | 'draft'
+        # GitHub's list endpoint includes `draft` but not `mergeable` (only
+        # the detail endpoint returns that). When `mergeable` is present
+        # (detail call), map it; otherwise fall back to 'unknown'.
+        draft = bool(pr.get('draft', False))
+        if draft:
+            merge_status = 'draft'
+        elif pr.get('mergeable') is True:
+            merge_status = 'clean'
+        elif pr.get('mergeable') is False:
+            merge_status = 'conflict'
+        else:
+            merge_status = 'unknown'
+
         return {
             'number': pr.get('number', 0),
             'title': pr.get('title', ''),
@@ -225,7 +326,11 @@ class GitHubProvider(BaseGitProvider):
             'updated_at': pr.get('updated_at', ''),
             'merged': pr.get('merged', False),
             'url': pr.get('html_url', ''),
+            'from_branch': pr.get('head', {}).get('ref', ''),
             'reviewers': reviewers,
+            'comment_count': comment_count,
+            'draft': draft,
+            'merge_status': merge_status,
         }
     
     def _normalize_commit(self, commit: Dict[str, Any]) -> Dict[str, Any]:

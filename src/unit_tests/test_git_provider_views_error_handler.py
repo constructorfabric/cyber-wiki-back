@@ -24,10 +24,10 @@ def _http_error(code: int, url: str = 'https://upstream.example/x') -> requests.
 
 
 class TestHandleProviderError:
-    def test_401_returns_authentication_failed(self):
+    def test_401_returns_bad_gateway(self):
         resp = GitProviderViewSet._handle_provider_error(_http_error(401), 'op')
-        assert resp.status_code == status.HTTP_401_UNAUTHORIZED
-        assert resp.data['code'] == 'AUTHENTICATION_FAILED'
+        assert resp.status_code == status.HTTP_502_BAD_GATEWAY
+        assert resp.data['code'] == 'GIT_PROVIDER_AUTH_FAILED'
 
     def test_403_returns_forbidden(self):
         resp = GitProviderViewSet._handle_provider_error(_http_error(403), 'op')

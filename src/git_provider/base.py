@@ -231,6 +231,15 @@ class BaseGitProvider(ABC):
         """
         pass
     
+    def get_pr_comment_authors(self, repo_id: str, pr_number: int) -> List[str]:
+        """Return a list of comment author usernames for a pull request.
+
+        Each entry corresponds to one comment — the same author may appear
+        multiple times.  Providers override this to supply real data; the
+        default returns an empty list (meaning "not available").
+        """
+        return []
+
     def normalize_repository_id(self, repo_data: Dict[str, Any]) -> str:
         """
         Normalize repository identifier across providers.

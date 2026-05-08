@@ -385,6 +385,32 @@ class BitbucketServerProvider(BaseGitProvider):
         response = self._request('GET', f'/projects/{project_key}/repos/{repo_slug}/pull-requests/{pr_number}')
         return self._normalize_pr(response.json())
     
+    def get_pr_comment_authors(self, repo_id: str, pr_number: int) -> List[str]:
+        """Return author usernames for all comments on a Bitbucket Server PR."""
+        project_key, repo_slug = repo_id.split('_', 1)
+        authors: List[str] = []
+        start = 0
+        while True:
+            try:
+                resp = self._request(
+                    'GET',
+                    f'/projects/{project_key}/repos/{repo_slug}/pull-requests/{pr_number}/activities',
+                    params={'start': start, 'limit': 500},
+                )
+                data = resp.json()
+            except Exception:
+                break
+            for activity in data.get('values', []):
+                if activity.get('action') in ('COMMENTED', 'REVIEWED'):
+                    user = activity.get('user') or activity.get('comment', {}).get('author', {})
+                    slug = user.get('slug') or user.get('name', '')
+                    if slug:
+                        authors.append(slug)
+            if data.get('isLastPage', True):
+                break
+            start = data.get('nextPageStart', start + 500)
+        return authors
+
     def get_pull_request_files(self, repo_id: str, pr_number: int) -> List[str]:
         """Get list of files changed in a pull request with pagination support."""
         import logging
@@ -612,6 +638,28 @@ class BitbucketServerProvider(BaseGitProvider):
                 'status': r.get('status', 'UNAPPROVED'),
             })
         
+        properties = pr.get('properties') or {}
+        comment_count = properties.get('commentCount', 0)
+
+        # merge_status: 'clean' | 'conflict' | 'vetoed' | 'unknown' | 'draft'
+        # Bitbucket Server exposes properties.mergeResult.outcome on list and
+        # detail endpoints. Possible values: CLEAN, CONFLICTED, VETOED (e.g.
+        # open tasks or required approvals missing).
+        draft = bool(pr.get('draft', False))
+        merge_outcome = (properties.get('mergeResult') or {}).get('outcome', '')
+        if draft:
+            merge_status = 'draft'
+        elif merge_outcome == 'CLEAN':
+            merge_status = 'clean'
+        elif merge_outcome == 'CONFLICTED':
+            merge_status = 'conflict'
+        elif merge_outcome == 'VETOED':
+            merge_status = 'vetoed'
+        else:
+            merge_status = 'unknown'
+
+        open_tasks = properties.get('openTaskCount', 0) or 0
+
         return {
             'number': pr.get('id', 0),
             'title': pr.get('title', ''),
@@ -623,6 +671,10 @@ class BitbucketServerProvider(BaseGitProvider):
             'url': links.get('self', [{}])[0].get('href', ''),
             'from_branch': pr.get('fromRef', {}).get('displayId', ''),
             'reviewers': reviewers,
+            'comment_count': comment_count,
+            'draft': draft,
+            'merge_status': merge_status,
+            'open_tasks': open_tasks,
         }
     
     def _normalize_commit(self, commit: Dict[str, Any]) -> Dict[str, Any]:

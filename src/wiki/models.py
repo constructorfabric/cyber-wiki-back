@@ -121,6 +121,13 @@ class Space(models.Model):
         help_text='Local path to pre-cloned edit fork repo (for development, overrides ssh_url)'
     )
     
+    # Bot filtering
+    bot_usernames = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='Bot username prefixes to exclude from reviewer filters (e.g., ["coderabbitai", "dependabot"])'
+    )
+
     # File Mapping Configuration
     filters = models.JSONField(
         default=list,

@@ -5,6 +5,7 @@ import logging
 import re
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any
 from .base import BaseEnrichmentProvider, EnrichmentCategory
 from source_provider.base import SourceAddress
@@ -67,37 +68,37 @@ class PREnrichmentProvider(BaseEnrichmentProvider):
             
             enrichments = []
             
-            # Check if this file is modified in any PR
+            # Check if this file is modified in any PR — fetch diffs in parallel.
             check_start = time.time()
-            for pr in prs_response.get('pull_requests', []):
+            prs = prs_response.get('pull_requests', [])
+            _PR_DIFF_MAX_WORKERS = 8
+
+            def _fetch_pr_diff(pr):
+                """Fetch diff for one PR and return enrichment dict or None."""
                 try:
                     pr_file_start = time.time()
-                    
-                    # Fetch diff once and use for both checking and parsing
                     diff_text = provider.get_pull_request_diff(
                         repo_id=address.repository,
                         pr_number=pr['number']
                     )
-                    
                     if not diff_text:
                         logger.debug(f"[PR] No diff available for PR #{pr['number']}")
-                        continue
+                        return None
 
                     # Fast pre-filter: skip full parse when the file path doesn't appear as a
                     # diff marker in this PR at all. Handles both "a/path" and bare "path" formats.
                     if (f'+++ b/{address.path}' not in diff_text and
                             f'+++ {address.path}' not in diff_text):
                         logger.debug(f"[PR] Skipping PR #{pr['number']} (file not in diff)")
-                        continue
+                        return None
 
                     hunks = self._parse_diff_hunks(diff_text, address.path)
-                    
+
                     pr_file_duration = time.time() - pr_file_start
                     logger.debug(f"[PR] Check PR #{pr['number']} took {pr_file_duration:.3f}s (hunks: {len(hunks)})")
-                    
-                    # Only add enrichment if we found actual hunks for this file
+
                     if hunks:
-                        enrichments.append({
+                        return {
                             'type': 'pr_diff',
                             'pr_number': pr['number'],
                             'pr_title': pr['title'],
@@ -108,13 +109,21 @@ class PREnrichmentProvider(BaseEnrichmentProvider):
                             'created_at': pr['created_at'],
                             'reviewers': pr.get('reviewers', []),
                             'diff_hunks': hunks,
-                        })
-                
+                        }
                 except Exception as e:
                     logger.warning(f"Failed to get files for PR {pr['number']}: {e}")
                     logger.debug(f"Traceback: {traceback.format_exc()}")
-                    continue
-            
+                return None
+
+            if prs:
+                max_workers = min(_PR_DIFF_MAX_WORKERS, len(prs))
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = {pool.submit(_fetch_pr_diff, pr): pr for pr in prs}
+                    for fut in as_completed(futures):
+                        result = fut.result()
+                        if result:
+                            enrichments.append(result)
+
             check_duration = time.time() - check_start
             logger.info(f"[PR] Check all PRs took {check_duration:.3f}s, found {len(enrichments)} matches")
             

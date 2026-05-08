@@ -2,6 +2,7 @@ import json
 import logging
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from django.http import StreamingHttpResponse
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
@@ -50,45 +51,61 @@ def _get_space_enrichments(request, space_slug, start_time):
         provider = GitProviderFactory.create_from_service_token(service_token)
 
         # ── PR diffs ──────────────────────────────────────────────────────────
-        # Always bypass cache for PR data so external changes (deleted/merged PRs)
-        # are reflected immediately without waiting for cache TTL to expire.
+        # Clear only stale PR cache entries (older than 30s) instead of wiping
+        # everything. This preserves cache hits for rapid re-opens while still
+        # reflecting external changes within a reasonable window.
         from users.models import APIResponseCache
+        from django.utils import timezone
+        from datetime import timedelta
+        stale_cutoff = timezone.now() - timedelta(seconds=30)
         deleted_pr_cache = APIResponseCache.objects.filter(
             user=request.user,
             endpoint__contains='pull-request',
+            created_at__lt=stale_cutoff,
         ).delete()
-        logger.info(f"[SpaceEnrichments] Cleared {deleted_pr_cache[0]} PR cache entries before fetch")
+        logger.info(f"[SpaceEnrichments] Cleared {deleted_pr_cache[0]} stale PR cache entries")
 
         prs_start = time.time()
         prs_response = provider.list_pull_requests(
             repo_id=repo_id, state='open', page=1, per_page=1000
         )
-        logger.info(f"[SpaceEnrichments] Fetched {len(prs_response.get('pull_requests', []))} PRs in {time.time() - prs_start:.3f}s")
+        prs = prs_response.get('pull_requests', [])
+        logger.info(f"[SpaceEnrichments] Fetched {len(prs)} PRs in {time.time() - prs_start:.3f}s")
 
         file_enrichments = {}
 
-        for pr in prs_response.get('pull_requests', []):
+        # Fetch diffs in parallel to hide network latency.
+        _SPACE_DIFF_MAX_WORKERS = 8
+
+        def _fetch_space_pr_diff(pr):
+            """Return (pr, diff_text) or (pr, None) on failure."""
             try:
-                diff_text = provider.get_pull_request_diff(repo_id=repo_id, pr_number=pr['number'])
-                if not diff_text:
-                    continue
-                for file_path in _extract_files_from_diff(diff_text):
-                    hunks = _parse_diff_hunks_for_file(diff_text, file_path)
-                    if hunks:
-                        _ensure_file(file_enrichments, file_path)
-                        file_enrichments[file_path]['pr_diff'].append({
-                            'type': 'pr_diff',
-                            'pr_number': pr['number'],
-                            'pr_title': pr['title'],
-                            'pr_author': pr['author'],
-                            'pr_state': pr['state'],
-                            'pr_url': pr['url'],
-                            'from_branch': pr.get('from_branch', ''),
-                            'created_at': pr['created_at'],
-                            'diff_hunks': hunks,
-                        })
+                return pr, provider.get_pull_request_diff(repo_id=repo_id, pr_number=pr['number'])
             except Exception as e:
-                logger.warning(f"[SpaceEnrichments] Failed to process PR #{pr.get('number')}: {e}")
+                logger.warning(f"[SpaceEnrichments] Failed to fetch diff for PR #{pr.get('number')}: {e}")
+                return pr, None
+
+        if prs:
+            max_workers = min(_SPACE_DIFF_MAX_WORKERS, len(prs))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for pr, diff_text in pool.map(_fetch_space_pr_diff, prs):
+                    if not diff_text:
+                        continue
+                    for file_path in _extract_files_from_diff(diff_text):
+                        hunks = _parse_diff_hunks_for_file(diff_text, file_path)
+                        if hunks:
+                            _ensure_file(file_enrichments, file_path)
+                            file_enrichments[file_path]['pr_diff'].append({
+                                'type': 'pr_diff',
+                                'pr_number': pr['number'],
+                                'pr_title': pr['title'],
+                                'pr_author': pr['author'],
+                                'pr_state': pr['state'],
+                                'pr_url': pr['url'],
+                                'from_branch': pr.get('from_branch', ''),
+                                'created_at': pr['created_at'],
+                                'diff_hunks': hunks,
+                            })
 
         # ── Comments ──────────────────────────────────────────────────────────
         source_uri_prefix = f"git://{space.git_provider}/{repo_id}/{branch}/"
@@ -497,6 +514,17 @@ def stream_enrichments(request):
     Auth: session cookie (same as all other API endpoints).
     nginx / gunicorn buffering is disabled via X-Accel-Buffering header.
     """
+    # Plain Django view — manually support Bearer token auth in addition to
+    # session auth, since DRF's authentication classes don't run here.
+    if not request.user.is_authenticated:
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        if auth_header.startswith('Bearer '):
+            from users.models import ApiToken
+            try:
+                api_token = ApiToken.objects.select_related('user').get(token=auth_header[7:])
+                request.user = api_token.user
+            except ApiToken.DoesNotExist:
+                pass
     if not request.user.is_authenticated:
         from django.http import HttpResponse
         return HttpResponse('Authentication required', status=401)

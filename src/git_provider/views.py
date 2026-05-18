@@ -80,7 +80,14 @@ class GitProviderViewSet(viewsets.ViewSet):
     _SAAS_PROVIDERS = {'github'}
 
     def _get_provider(self, request):
-        """Get Git provider instance for the user."""
+        """Get Git provider instance for the user.
+
+        Falls back to a token without `base_url` filtering when the exact
+        match fails — historically stored tokens may differ from the query
+        param by a trailing slash or scheme detail. This mirrors the
+        fallback wiki/views_file_mapping uses, so all git-provider endpoints
+        stay consistent with the rest of the app.
+        """
         provider_type = request.query_params.get('provider')
         base_url = request.query_params.get('base_url')
 
@@ -91,16 +98,21 @@ class GitProviderViewSet(viewsets.ViewSet):
         if not base_url and provider_type not in self._SAAS_PROVIDERS:
             raise ValueError('provider and base_url are required')
 
-        try:
-            qs = ServiceToken.objects.filter(user=request.user, service_type=provider_type)
-            if base_url and provider_type not in self._SAAS_PROVIDERS:
-                qs = qs.filter(base_url=base_url)
-            service_token = qs.first()
-            if not service_token:
-                raise ServiceToken.DoesNotExist
-            return GitProviderFactory.create_from_service_token(service_token)
-        except ServiceToken.DoesNotExist:
+        service_token = None
+        if base_url and provider_type not in self._SAAS_PROVIDERS:
+            service_token = ServiceToken.objects.filter(
+                user=request.user,
+                service_type=provider_type,
+                base_url=base_url,
+            ).first()
+        if service_token is None:
+            service_token = ServiceToken.objects.filter(
+                user=request.user,
+                service_type=provider_type,
+            ).first()
+        if service_token is None:
             raise ValueError('Git credentials not found')
+        return GitProviderFactory.create_from_service_token(service_token)
 
     @staticmethod
     def _handle_provider_error(exc, log_prefix):

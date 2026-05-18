@@ -34,26 +34,20 @@ class FileMappingViewSet(viewsets.ModelViewSet):
             raise ValueError("Space does not have Git configuration")
         
         logger.info(f"Looking for service token: provider={space.git_provider}, base_url={space.git_base_url}, user={self.request.user.username}")
-        
-        # Find service token for this provider and base_url
-        # This is important for getting the correct token with custom headers
+
+        # Token lookup is by exact (user, service_type, base_url) tuple.
+        # Both Space.git_base_url and ServiceToken.base_url are
+        # canonicalised on save (service_tokens.url.canonical_base_url),
+        # so this match doesn't need any fallback.
         service_token = ServiceToken.objects.filter(
             user=self.request.user,
             service_type=space.git_provider,
-            base_url=space.git_base_url
+            base_url=space.git_base_url,
         ).first()
-        
-        if not service_token:
-            logger.warning(f"No token found with base_url={space.git_base_url}, trying without base_url")
-            # Fallback: try without base_url filter
-            service_token = ServiceToken.objects.filter(
-                user=self.request.user,
-                service_type=space.git_provider
-            ).first()
-        
+
         if not service_token:
             raise ValueError(f"No credentials found for provider: {space.git_provider}")
-        
+
         logger.info(f"Found service token: id={service_token.id}, base_url={service_token.base_url}")
         return GitProviderFactory.create_from_service_token(service_token)
     
@@ -281,10 +275,13 @@ class FileMappingViewSet(viewsets.ModelViewSet):
     @extend_schema(
         operation_id='file_mappings_get_tree',
         summary='Get file tree with mappings',
-        description='Get the file tree with all mappings applied.',
+        description='Get the file tree with all mappings applied. When `path` '
+                    'is provided, returns children of that folder for '
+                    'lazy-loading; otherwise returns the repo root.',
         parameters=[
             OpenApiParameter(name='mode', type=str, description='View mode: dev or documents'),
             OpenApiParameter(name='filters', type=str, description='Comma-separated file extensions'),
+            OpenApiParameter(name='path', type=str, description='Subfolder path (empty = root)'),
         ],
         responses={200: {
             'type': 'object',
@@ -300,15 +297,17 @@ class FileMappingViewSet(viewsets.ModelViewSet):
         mode = request.query_params.get('mode', 'dev')
         filters_str = request.query_params.get('filters', '')
         filters = [f.strip() for f in filters_str.split(',') if f.strip()]
-        
+        path = request.query_params.get('path', '') or ''
+
         # Get git provider
         git_provider = self._get_git_provider(space)
-        
+
         # Build tree with mappings
         try:
             tree = FileMappingService.build_tree_with_mappings(
                 space=space,
                 git_provider=git_provider,
+                path=path,
                 mode=mode,
                 filters=filters if filters else None
             )
@@ -408,64 +407,129 @@ class FileMappingViewSet(viewsets.ModelViewSet):
     )
     @action(detail=False, methods=['post'])
     def refresh(self, request, space_slug=None):
-        """Refresh effective mappings - extract fresh content and update display names."""
+        """Refresh effective mappings - extract fresh content and update display names.
+
+        Walks the full repo tree recursively. For every extractable file
+        (markdown/xml) whose effective source needs file content, fetches the
+        file and refreshes (or creates) a cached FileMapping. Files that
+        already have a `custom` mapping or whose effective source is
+        `filename` are skipped.
+        """
+        import logging
+        import os
+        from django.utils import timezone
+        from .services.file_mapping import FileMappingService, EXTRACTABLE_EXTS, EXTRACTION_SOURCES
+
+        logger = logging.getLogger(__name__)
         space = get_object_or_404(Space, slug=space_slug)
-        
+
         try:
-            # Get git provider
             git_provider = self._get_git_provider(space)
-            
-            # Get all file mappings (not folders)
-            mappings = FileMapping.objects.filter(space=space, is_folder=False)
+
+            # Resolve repo coordinates the same way build_tree_with_mappings does
+            if space.git_project_key:
+                project_key = space.git_project_key
+                repo_slug = space.git_repository_id or space.git_repository_name or ''
+            elif space.git_repository_id and '/' in space.git_repository_id:
+                project_key, repo_slug = space.git_repository_id.split('/', 1)
+            elif space.git_repository_name and '/' in space.git_repository_name:
+                project_key, repo_slug = space.git_repository_name.split('/', 1)
+            else:
+                project_key = space.git_project_key or ''
+                repo_slug = space.git_repository_id or space.git_repository_name or ''
+
+            branch = space.git_default_branch or 'main'
+
+            # Recursive tree from the repo root
+            try:
+                raw_tree = git_provider.get_directory_tree(
+                    project_key=project_key,
+                    repo_slug=repo_slug,
+                    path='',
+                    branch=branch,
+                    recursive=True,
+                )
+            except TypeError:
+                # Older providers without `recursive` kwarg — fall back to one-shot
+                raw_tree = git_provider.get_directory_tree(
+                    project_key=project_key,
+                    repo_slug=repo_slug,
+                    path='',
+                    branch=branch,
+                )
+
+            all_mappings = list(FileMapping.objects.filter(space=space))
+            mappings_by_path = {m.file_path: m for m in all_mappings}
+            for m in all_mappings:
+                if m.is_folder:
+                    mappings_by_path[m.file_path.rstrip('/')] = m
+            space_default_source = space.default_display_name_source or 'first_h1'
+
             updated_count = 0
-            
-            for mapping in mappings:
-                # Skip custom names - they don't need extraction
-                if mapping.display_name_source == 'custom':
+            for item in raw_tree:
+                file_path = item.get('path', '')
+                if not file_path or item.get('type') == 'dir':
                     continue
-                
-                # Skip filename source - no extraction needed
-                if mapping.effective_display_name_source == 'filename':
+
+                ext = os.path.splitext(file_path)[1].lower()
+                if ext not in EXTRACTABLE_EXTS:
                     continue
-                
+
+                direct = mappings_by_path.get(file_path)
+                if direct and direct.display_name_source == 'custom':
+                    continue
+
+                effective_source = FileMappingService._resolve_effective_source(
+                    space=space,
+                    file_path=file_path,
+                    direct_mapping=direct,
+                    is_folder=False,
+                    mappings_by_path=mappings_by_path,
+                    space_default_source=space_default_source,
+                )
+                if effective_source not in EXTRACTION_SOURCES:
+                    continue
+
                 try:
-                    # Get file content
                     file_data = git_provider.get_file_content(
-                        space.git_repository_id,
-                        mapping.file_path,
-                        ref=space.git_default_branch or 'main'
+                        project_key=project_key,
+                        repo_slug=repo_slug,
+                        file_path=file_path,
+                        branch=branch,
                     )
-                    content = file_data.get('content', '')
-                    
-                    # Extract name based on effective source
-                    source = mapping.effective_display_name_source or 'first_h1'
+                    content = file_data.get('content', '') if isinstance(file_data, dict) else ''
                     extracted_name = NameExtractionService.extract_name(
-                        mapping.file_path,
-                        content,
-                        source
+                        file_path, content, effective_source,
                     )
-                    
-                    # Update if changed
-                    if extracted_name and extracted_name != mapping.extracted_name:
-                        mapping.extracted_name = extracted_name
-                        mapping.extracted_at = None  # Will be set by save
-                        mapping.save(update_fields=['extracted_name', 'extracted_at'])
-                        updated_count += 1
-                        
-                except Exception as e:
-                    # Log error but continue with other files
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.warning(f'Failed to refresh {mapping.file_path}: {str(e)}')
+                except Exception as exc:
+                    logger.warning(f'refresh: skip {file_path} ({exc})')
                     continue
-            
+
+                if not extracted_name:
+                    continue
+
+                mapping = direct
+                if mapping is None:
+                    mapping = FileMapping(
+                        space=space,
+                        file_path=file_path,
+                        is_folder=False,
+                        is_visible=True,
+                    )
+                if mapping.extracted_name == extracted_name and mapping.pk:
+                    continue
+                mapping.extracted_name = extracted_name
+                mapping.extracted_at = timezone.now()
+                mapping.save()
+                updated_count += 1
+
             return Response({
                 'updated_count': updated_count,
                 'message': f'Refresh complete. Updated {updated_count} display names.'
             })
-            
+
         except Exception as e:
             return Response(
                 {'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )

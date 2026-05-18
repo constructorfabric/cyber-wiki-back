@@ -5,6 +5,8 @@ from django.db import models
 from django.contrib.auth.models import User
 import uuid
 
+from service_tokens.url import canonical_base_url
+
 
 class Space(models.Model):
     """
@@ -173,7 +175,14 @@ class Space(models.Model):
 
     def __str__(self):
         return self.name
-    
+
+    def save(self, *args, **kwargs):
+        # Canonicalise git_base_url so it stays in sync with the matching
+        # ServiceToken.base_url (which also goes through the same helper
+        # on save) — exact string equality is what the token lookup uses.
+        self.git_base_url = canonical_base_url(self.git_base_url)
+        super().save(*args, **kwargs)
+
     @property
     def edit_enabled(self) -> bool:
         """Check if editing is configured for this space."""
@@ -1410,47 +1419,42 @@ class FileMapping(models.Model):
             # Files with explicit setting use it
             source = self.display_name_source
         else:
-            # Files: Walk up parent folders for children_display_name_source
+            # Files: Walk up parent folders for children_display_name_source.
+            # Folder paths may be stored with or without a trailing slash; try both.
             source = None
             path_parts = self.file_path.split('/')
-            
+
             for i in range(len(path_parts) - 1, 0, -1):
-                parent_path = '/'.join(path_parts[:i])
-                try:
-                    parent = FileMapping.objects.get(
-                        space=self.space,
-                        file_path=parent_path,
-                        is_folder=True
-                    )
-                    if parent.children_display_name_source:
-                        source = parent.children_display_name_source
-                        break
-                except FileMapping.DoesNotExist:
-                    continue
-            
+                parent_prefix = '/'.join(path_parts[:i])
+                parent = FileMapping.objects.filter(
+                    space=self.space,
+                    is_folder=True,
+                    file_path__in=[parent_prefix, parent_prefix + '/'],
+                ).first()
+                if parent and parent.children_display_name_source:
+                    source = parent.children_display_name_source
+                    break
+
             # Files: Fall back to space default if no parent rule found
             if source is None:
                 source = self.space.default_display_name_source or 'first_h1'
-        
-        # Determine visibility - check entire parent chain
-        # If ANY parent is hidden, this item should be hidden
+
+        # Determine visibility - check entire parent chain.
+        # If ANY parent is hidden, this item should be hidden.
         visible = self.is_visible
         if visible:  # Only check parents if this item itself is visible
             path_parts = self.file_path.split('/')
             for i in range(len(path_parts) - 1, 0, -1):
-                parent_path = '/'.join(path_parts[:i])
-                try:
-                    parent = FileMapping.objects.get(
-                        space=self.space,
-                        file_path=parent_path,
-                        is_folder=True
-                    )
-                    if not parent.is_visible:
-                        visible = False
-                        break
-                except FileMapping.DoesNotExist:
-                    continue
-        
+                parent_prefix = '/'.join(path_parts[:i])
+                parent = FileMapping.objects.filter(
+                    space=self.space,
+                    is_folder=True,
+                    file_path__in=[parent_prefix, parent_prefix + '/'],
+                ).first()
+                if parent and not parent.is_visible:
+                    visible = False
+                    break
+
         return (source, visible)
     
     def save(self, *args, **kwargs):

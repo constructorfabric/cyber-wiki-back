@@ -442,21 +442,15 @@ class FileMappingCreateSerializer(serializers.ModelSerializer):
             
             logger.info(f'[EXTRACT] User: {request.user.username}')
             
-            # Find service token for this provider
+            # Token lookup is by exact (user, service_type, base_url) tuple
+            # — both base_url columns are canonicalised on save, so no
+            # fallback is needed.
             service_token = ServiceToken.objects.filter(
                 user=request.user,
                 service_type=space.git_provider,
-                base_url=space.git_base_url
+                base_url=space.git_base_url,
             ).first()
-            
-            if not service_token:
-                logger.info(f'[EXTRACT] No token with base_url, trying without')
-                # Fallback: try without base_url filter
-                service_token = ServiceToken.objects.filter(
-                    user=request.user,
-                    service_type=space.git_provider
-                ).first()
-            
+
             if not service_token:
                 logger.warning(f'[EXTRACT] No service token found for {space.git_provider}')
                 return

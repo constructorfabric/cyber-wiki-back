@@ -8,6 +8,7 @@ from rest_framework.permissions import IsAuthenticated
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample
 from drf_spectacular.types import OpenApiTypes
 from service_tokens.models import ServiceToken
+from service_tokens.url import canonical_base_url
 from .factory import GitProviderFactory
 from .serializers import (
     RepositorySerializer,
@@ -80,7 +81,13 @@ class GitProviderViewSet(viewsets.ViewSet):
     _SAAS_PROVIDERS = {'github'}
 
     def _get_provider(self, request):
-        """Get Git provider instance for the user."""
+        """Get Git provider instance for the user.
+
+        Token lookup is by exact `(user, service_type, base_url)` tuple.
+        `base_url` is canonicalised on save (see service_tokens/url.py) and
+        Space.git_base_url is canonicalised in lock-step, so the frontend
+        can pass `space.git_base_url` straight through without massaging.
+        """
         provider_type = request.query_params.get('provider')
         base_url = request.query_params.get('base_url')
 
@@ -91,16 +98,13 @@ class GitProviderViewSet(viewsets.ViewSet):
         if not base_url and provider_type not in self._SAAS_PROVIDERS:
             raise ValueError('provider and base_url are required')
 
-        try:
-            qs = ServiceToken.objects.filter(user=request.user, service_type=provider_type)
-            if base_url and provider_type not in self._SAAS_PROVIDERS:
-                qs = qs.filter(base_url=base_url)
-            service_token = qs.first()
-            if not service_token:
-                raise ServiceToken.DoesNotExist
-            return GitProviderFactory.create_from_service_token(service_token)
-        except ServiceToken.DoesNotExist:
+        qs = ServiceToken.objects.filter(user=request.user, service_type=provider_type)
+        if base_url and provider_type not in self._SAAS_PROVIDERS:
+            qs = qs.filter(base_url=canonical_base_url(base_url))
+        service_token = qs.first()
+        if service_token is None:
             raise ValueError('Git credentials not found')
+        return GitProviderFactory.create_from_service_token(service_token)
 
     @staticmethod
     def _handle_provider_error(exc, log_prefix):

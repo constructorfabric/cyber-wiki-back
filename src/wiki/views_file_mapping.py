@@ -34,26 +34,20 @@ class FileMappingViewSet(viewsets.ModelViewSet):
             raise ValueError("Space does not have Git configuration")
         
         logger.info(f"Looking for service token: provider={space.git_provider}, base_url={space.git_base_url}, user={self.request.user.username}")
-        
-        # Find service token for this provider and base_url
-        # This is important for getting the correct token with custom headers
+
+        # Token lookup is by exact (user, service_type, base_url) tuple.
+        # Both Space.git_base_url and ServiceToken.base_url are
+        # canonicalised on save (service_tokens.url.canonical_base_url),
+        # so this match doesn't need any fallback.
         service_token = ServiceToken.objects.filter(
             user=self.request.user,
             service_type=space.git_provider,
-            base_url=space.git_base_url
+            base_url=space.git_base_url,
         ).first()
-        
-        if not service_token:
-            logger.warning(f"No token found with base_url={space.git_base_url}, trying without base_url")
-            # Fallback: try without base_url filter
-            service_token = ServiceToken.objects.filter(
-                user=self.request.user,
-                service_type=space.git_provider
-            ).first()
-        
+
         if not service_token:
             raise ValueError(f"No credentials found for provider: {space.git_provider}")
-        
+
         logger.info(f"Found service token: id={service_token.id}, base_url={service_token.base_url}")
         return GitProviderFactory.create_from_service_token(service_token)
     

@@ -5,6 +5,8 @@ from django.db import models
 from django.contrib.auth.models import User
 import uuid
 
+from service_tokens.url import canonical_base_url
+
 
 class Space(models.Model):
     """
@@ -173,7 +175,14 @@ class Space(models.Model):
 
     def __str__(self):
         return self.name
-    
+
+    def save(self, *args, **kwargs):
+        # Canonicalise git_base_url so it stays in sync with the matching
+        # ServiceToken.base_url (which also goes through the same helper
+        # on save) — exact string equality is what the token lookup uses.
+        self.git_base_url = canonical_base_url(self.git_base_url)
+        super().save(*args, **kwargs)
+
     @property
     def edit_enabled(self) -> bool:
         """Check if editing is configured for this space."""

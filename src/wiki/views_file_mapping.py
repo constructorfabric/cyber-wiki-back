@@ -281,10 +281,13 @@ class FileMappingViewSet(viewsets.ModelViewSet):
     @extend_schema(
         operation_id='file_mappings_get_tree',
         summary='Get file tree with mappings',
-        description='Get the file tree with all mappings applied.',
+        description='Get the file tree with all mappings applied. When `path` '
+                    'is provided, returns children of that folder for '
+                    'lazy-loading; otherwise returns the repo root.',
         parameters=[
             OpenApiParameter(name='mode', type=str, description='View mode: dev or documents'),
             OpenApiParameter(name='filters', type=str, description='Comma-separated file extensions'),
+            OpenApiParameter(name='path', type=str, description='Subfolder path (empty = root)'),
         ],
         responses={200: {
             'type': 'object',
@@ -300,15 +303,17 @@ class FileMappingViewSet(viewsets.ModelViewSet):
         mode = request.query_params.get('mode', 'dev')
         filters_str = request.query_params.get('filters', '')
         filters = [f.strip() for f in filters_str.split(',') if f.strip()]
-        
+        path = request.query_params.get('path', '') or ''
+
         # Get git provider
         git_provider = self._get_git_provider(space)
-        
+
         # Build tree with mappings
         try:
             tree = FileMappingService.build_tree_with_mappings(
                 space=space,
                 git_provider=git_provider,
+                path=path,
                 mode=mode,
                 filters=filters if filters else None
             )

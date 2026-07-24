@@ -13,6 +13,8 @@ Architecture:
 import asyncio
 import logging
 import os
+import re
+from urllib.parse import urlsplit, urlunsplit
 import shutil
 import tempfile
 from pathlib import Path
@@ -21,6 +23,36 @@ from typing import Dict, List, Optional, Any
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _redact_git_text(value: str) -> str:
+    """Redact credentials embedded in git-facing text."""
+    if not value or '@' not in value or '://' not in value:
+        return value
+
+    def _replace(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        try:
+            parts = urlsplit(candidate)
+        except ValueError:
+            return candidate
+
+        if not parts.username and not parts.password:
+            return candidate
+
+        host = parts.hostname or ''
+        if parts.port:
+            host = f'{host}:{parts.port}'
+        if parts.username:
+            host = f'{parts.username}:***@{host}'
+        return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+
+    return re.sub(r'https?://[^\s]+', _replace, value)
+
+
+def _redact_git_args(args: List[str]) -> List[str]:
+    """Redact credentials from command arguments before logging."""
+    return [_redact_git_text(arg) for arg in args]
 
 
 class GitError(Exception):
@@ -127,7 +159,8 @@ class GitWorktreeManager:
             GitError: If command fails
         """
         cmd = ['git'] + args
-        logger.debug(f"Running git command: {' '.join(cmd)} in {cwd}")
+        safe_cmd = ['git'] + _redact_git_args(args)
+        logger.debug(f"Running git command: {' '.join(safe_cmd)} in {cwd}")
         
         try:
             process = await asyncio.create_subprocess_exec(
@@ -145,23 +178,27 @@ class GitWorktreeManager:
             
             stdout_str = stdout.decode('utf-8', errors='replace').strip()
             stderr_str = stderr.decode('utf-8', errors='replace').strip()
+            safe_stdout = _redact_git_text(stdout_str)
+            safe_stderr = _redact_git_text(stderr_str)
             
             if process.returncode != 0:
-                logger.error(f"Git command failed: stderr={stderr_str!r} stdout={stdout_str!r}")
-                detail = stderr_str or stdout_str or f'exit {process.returncode}'
+                logger.error(f"Git command failed: stderr={safe_stderr!r} stdout={safe_stdout!r}")
+                detail = safe_stderr or safe_stdout or f'exit {process.returncode}'
                 raise GitError(
-                    f"Git command failed ({' '.join(args)}): {detail}",
+                    f"Git command failed ({' '.join(_redact_git_args(args))}): {detail}",
                     returncode=process.returncode,
-                    stderr=stderr_str or stdout_str
+                    stderr=detail
                 )
             
-            if stderr_str:
-                logger.debug(f"Git stderr: {stderr_str}")
+            if safe_stderr:
+                logger.debug(f"Git stderr: {safe_stderr}")
             
             return stdout_str
             
         except asyncio.TimeoutError:
-            raise GitError(f"Git command timed out after {timeout}s: {' '.join(args)}")
+            raise GitError(
+                f"Git command timed out after {timeout}s: {' '.join(_redact_git_args(args))}"
+            )
     
     def _run_git_sync(
         self,
@@ -189,7 +226,8 @@ class GitWorktreeManager:
         import subprocess
 
         cmd = ['git'] + args
-        logger.debug(f"Running git command (sync): {' '.join(cmd)} in {cwd}")
+        safe_cmd = ['git'] + _redact_git_args(args)
+        logger.debug(f"Running git command (sync): {' '.join(safe_cmd)} in {cwd}")
 
         try:
             result = subprocess.run(
@@ -202,26 +240,30 @@ class GitWorktreeManager:
 
             stdout_str = result.stdout.decode('utf-8', errors='replace').strip()
             stderr_str = result.stderr.decode('utf-8', errors='replace').strip()
+            safe_stdout = _redact_git_text(stdout_str)
+            safe_stderr = _redact_git_text(stderr_str)
 
             if result.returncode != 0:
                 if quiet:
-                    logger.debug(f"Git command failed (expected): stderr={stderr_str!r} stdout={stdout_str!r}")
+                    logger.debug(f"Git command failed (expected): stderr={safe_stderr!r} stdout={safe_stdout!r}")
                 else:
-                    logger.error(f"Git command failed: stderr={stderr_str!r} stdout={stdout_str!r}")
-                detail = stderr_str or stdout_str or f'exit {result.returncode}'
+                    logger.error(f"Git command failed: stderr={safe_stderr!r} stdout={safe_stdout!r}")
+                detail = safe_stderr or safe_stdout or f'exit {result.returncode}'
                 raise GitError(
-                    f"Git command failed ({' '.join(args)}): {detail}",
+                    f"Git command failed ({' '.join(_redact_git_args(args))}): {detail}",
                     returncode=result.returncode,
-                    stderr=stderr_str or stdout_str
+                    stderr=detail
                 )
             
-            if stderr_str:
-                logger.debug(f"Git stderr: {stderr_str}")
+            if safe_stderr:
+                logger.debug(f"Git stderr: {safe_stderr}")
             
             return stdout_str
             
         except subprocess.TimeoutExpired:
-            raise GitError(f"Git command timed out after {timeout}s: {' '.join(args)}")
+            raise GitError(
+                f"Git command timed out after {timeout}s: {' '.join(_redact_git_args(args))}"
+            )
     
     def get_bare_repo_path(self, space_id: str) -> str:
         """Get path to cached bare repo for a space."""

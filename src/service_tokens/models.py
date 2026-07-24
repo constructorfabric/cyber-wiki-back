@@ -11,7 +11,7 @@ from django.dispatch import receiver
 from cryptography.fernet import Fernet
 import base64
 
-from .url import canonical_base_url
+from .url import canonical_base_url, normalize_service_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +114,10 @@ class ServiceToken(models.Model):
         # Canonicalise base_url so lookups against Space.git_base_url and
         # other ServiceToken rows compare equal regardless of trailing
         # slash or scheme/host casing.
-        self.base_url = canonical_base_url(self.base_url)
+        if self.service_type == ServiceType.GITHUB:
+            self.base_url = normalize_service_base_url(self.service_type, self.base_url)
+        else:
+            self.base_url = canonical_base_url(self.base_url)
         super().save(*args, **kwargs)
 
     @staticmethod

@@ -7,7 +7,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample
 from drf_spectacular.types import OpenApiTypes
-from service_tokens.models import ServiceToken
+from service_tokens.models import ServiceToken, ServiceType
 from service_tokens.url import canonical_base_url
 from .factory import GitProviderFactory
 from .serializers import (
@@ -16,8 +16,16 @@ from .serializers import (
     CommitSerializer
 )
 from users.decorators import cached_api_response
+from wiki.access import accessible_spaces_for_user
 import base64
+import hashlib
 import logging
+import os
+import stat
+import subprocess
+import tempfile
+import shutil
+from urllib.parse import urlparse, urlunparse
 
 logger = logging.getLogger(__name__)
 
@@ -30,16 +38,13 @@ class _BlameClone:
     """
 
     @staticmethod
-    def with_auth(space) -> str | None:
-        """Return `space.git_repository_url` with the user's git token spliced
-        in as basic auth, or None if we can't build a usable HTTPS URL.
+    def resolve_https_credentials(space, user) -> dict | None:
+        """Return the current user's usable HTTPS clone credentials, or None.
 
-        Falls back to the unauthenticated URL only for `http://` / `https://`
-        repos that don't actually need auth (rare in practice but avoids
-        unnecessary DB lookups during local testing).
+        The result is bound to the current user's matching `(provider, base_url)`
+        token so cache reuse across users or revoked/rotated tokens fails closed.
         """
-        from urllib.parse import quote, urlparse, urlunparse
-        from service_tokens.models import ServiceToken
+        from urllib.parse import urlparse
 
         repo_url = (space.git_repository_url or '').strip()
         if not repo_url:
@@ -48,23 +53,179 @@ class _BlameClone:
         if parsed.scheme not in ('http', 'https'):
             return None
 
-        token = (
-            ServiceToken.objects
-            .filter(service_type=space.git_provider)
-            .order_by('-id')
-            .first()
+        service_token = GitProviderFactory.get_service_token(
+            user=user,
+            provider=space.git_provider,
+            base_url=canonical_base_url(space.git_base_url),
         )
-        if not token or not token.token:
-            return repo_url
-        # GitHub: any non-empty username works; the token is the password.
-        # Bitbucket Cloud: x-token-auth is the recommended placeholder.
-        username = (
-            'x-token-auth'
-            if 'bitbucket' in (space.git_provider or '').lower()
-            else 'oauth2'
+        if not service_token:
+            return None
+
+        token = service_token.get_token()
+        if not token:
+            return None
+
+        if space.git_provider == ServiceType.BITBUCKET_SERVER:
+            username = service_token.get_username()
+            if not username:
+                return None
+        else:
+            username = 'oauth2'
+
+        custom_header_name = None
+        custom_header_token = None
+        if space.git_provider == ServiceType.BITBUCKET_SERVER:
+            custom_header = GitProviderFactory.get_custom_header_token(
+                user=user,
+                base_url=canonical_base_url(space.git_base_url),
+            )
+            if custom_header:
+                custom_header_name = custom_header.header_name
+                custom_header_token = custom_header.get_token()
+
+        return {
+            'repo_url': repo_url,
+            'provider': space.git_provider,
+            'base_url': canonical_base_url(space.git_base_url),
+            'username': username,
+            'token': token,
+            'custom_header_name': custom_header_name,
+            'custom_header_token': custom_header_token,
+        }
+
+    @staticmethod
+    def with_auth(space, user) -> str | None:
+        """Backward-compatible helper retained for existing unit tests."""
+        from urllib.parse import quote
+
+        credentials = _BlameClone.resolve_https_credentials(space, user)
+        if not credentials:
+            return None
+
+        parsed = urlparse(credentials['repo_url'])
+        netloc = (
+            f"{quote(credentials['username'], safe='')}:"
+            f"{quote(credentials['token'], safe='')}@{parsed.netloc}"
         )
-        netloc = f"{quote(username, safe='')}:{quote(token.token, safe='')}@{parsed.netloc}"
         return urlunparse(parsed._replace(netloc=netloc))
+
+    @staticmethod
+    def cache_key(credentials: dict) -> str:
+        """Return a stable cache suffix bound to the active credential tuple."""
+        parsed_repo_url = urlparse(credentials['repo_url'] or '')
+        canonical_repo_url = urlunparse((
+            parsed_repo_url.scheme.lower(),
+            parsed_repo_url.netloc.lower(),
+            parsed_repo_url.path.rstrip('/'),
+            '',
+            '',
+            '',
+        ))
+        digest = hashlib.sha256(
+            '||'.join(
+                [
+                    credentials['provider'] or '',
+                    credentials['base_url'] or '',
+                    canonical_repo_url,
+                    credentials['username'] or '',
+                    credentials['token'] or '',
+                ]
+            ).encode('utf-8')
+        ).hexdigest()
+        return digest[:16]
+
+    @staticmethod
+    def cache_path(manager, space, user) -> str | None:
+        """Return the cache path for the active credential tuple, or None."""
+        credentials = _BlameClone.resolve_https_credentials(space, user)
+        if not credentials:
+            return None
+        return os.path.join(
+            manager.cache_dir,
+            'spaces',
+            str(space.id),
+            f"blame-{_BlameClone.cache_key(credentials)}.git",
+        )
+
+    @staticmethod
+    def build_git_env(manager, credentials: dict) -> tuple[dict, str]:
+        """Build a one-shot askpass environment for HTTPS git auth."""
+        env = manager._get_git_env().copy()
+        fd, askpass_path = tempfile.mkstemp(prefix='cyberwiki-git-askpass-', suffix='.sh')
+        try:
+            os.write(
+                fd,
+                (
+                    '#!/bin/sh\n'
+                    'case "$1" in\n'
+                    '  *sername*) printf "%s" "$CYBERWIKI_GIT_USERNAME" ;;\n'
+                    '  *) printf "%s" "$CYBERWIKI_GIT_PASSWORD" ;;\n'
+                    'esac\n'
+                ).encode('utf-8'),
+            )
+        finally:
+            os.close(fd)
+        os.chmod(askpass_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        env.update(
+            {
+                'GIT_TERMINAL_PROMPT': '0',
+                'GIT_ASKPASS': askpass_path,
+                'CYBERWIKI_GIT_USERNAME': credentials['username'],
+                'CYBERWIKI_GIT_PASSWORD': credentials['token'],
+            }
+        )
+        if credentials.get('custom_header_name') and credentials.get('custom_header_token'):
+            _BlameClone._append_git_config_env(
+                env,
+                'http.extraHeader',
+                f"{credentials['custom_header_name']}: {credentials['custom_header_token']}",
+            )
+        return env, askpass_path
+
+    @staticmethod
+    def _append_git_config_env(env: dict, key: str, value: str) -> None:
+        """Append a git -c equivalent via environment variables."""
+        count = int(env.get('GIT_CONFIG_COUNT', '0'))
+        env[f'GIT_CONFIG_KEY_{count}'] = key
+        env[f'GIT_CONFIG_VALUE_{count}'] = value
+        env['GIT_CONFIG_COUNT'] = str(count + 1)
+
+    @staticmethod
+    def clone_bare_repo(manager, credentials: dict, blame_path: str) -> str:
+        """Clone to a temp directory and atomically publish the cache path."""
+        parent_dir = os.path.dirname(blame_path)
+        os.makedirs(parent_dir, exist_ok=True)
+        temp_path = tempfile.mkdtemp(
+            prefix=f".{os.path.basename(blame_path)}.",
+            dir=parent_dir,
+        )
+        env, askpass_path = _BlameClone.build_git_env(manager, credentials)
+        try:
+            subprocess.run(
+                ['git', 'clone', '--bare', credentials['repo_url'], temp_path],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=180,
+            )
+        finally:
+            try:
+                os.unlink(askpass_path)
+            except OSError:
+                pass
+
+        try:
+            os.rename(temp_path, blame_path)
+            temp_path = None
+            return blame_path
+        except OSError:
+            if os.path.exists(blame_path):
+                return blame_path
+            raise
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                shutil.rmtree(temp_path, ignore_errors=True)
 
 
 class GitProviderViewSet(viewsets.ViewSet):
@@ -76,10 +237,6 @@ class GitProviderViewSet(viewsets.ViewSet):
     # Note: Git credentials are now managed via /api/service-tokens/v1/tokens/
     # This ViewSet only handles repository operations using those credentials
     
-    # SaaS providers where there's only one instance (no self-hosted URL
-    # distinction), so base_url filtering may cause false negatives.
-    _SAAS_PROVIDERS = {'github'}
-
     def _get_provider(self, request):
         """Get Git provider instance for the user.
 
@@ -94,16 +251,22 @@ class GitProviderViewSet(viewsets.ViewSet):
         if not provider_type:
             raise ValueError('provider is required')
 
-        # For SaaS providers, base_url is optional (there's only one instance).
-        if not base_url and provider_type not in self._SAAS_PROVIDERS:
+        if not base_url and provider_type != 'github':
             raise ValueError('provider and base_url are required')
 
-        qs = ServiceToken.objects.filter(user=request.user, service_type=provider_type)
-        if base_url and provider_type not in self._SAAS_PROVIDERS:
-            qs = qs.filter(base_url=canonical_base_url(base_url))
-        service_token = qs.first()
-        if service_token is None:
-            raise ValueError('Git credentials not found')
+        if base_url:
+            service_token = GitProviderFactory.get_service_token(
+                user=request.user,
+                provider=provider_type,
+                base_url=canonical_base_url(base_url),
+            )
+            if service_token is None:
+                raise ValueError('Git credentials not found')
+        else:
+            service_token = GitProviderFactory.get_source_service_token(
+                user=request.user,
+                provider=provider_type,
+            )
         return GitProviderFactory.create_from_service_token(service_token)
 
     @staticmethod
@@ -337,7 +500,7 @@ class GitProviderViewSet(viewsets.ViewSet):
             # once the bare repo has been cached (first commit or fetch).
             local_blame_used = False
             if space_id:
-                local = self._blame_from_local_clone(space_id, file_path, branch)
+                local = self._blame_from_local_clone(space_id, file_path, branch, request.user)
                 if local is not None:
                     blame = local
                     local_blame_used = True
@@ -366,7 +529,7 @@ class GitProviderViewSet(viewsets.ViewSet):
             return self._handle_provider_error(e, 'Error getting file blame')
 
     @staticmethod
-    def _blame_from_local_clone(space_id: str, file_path: str, branch: str):
+    def _blame_from_local_clone(space_id: str, file_path: str, branch: str, user=None):
         """Try to blame against a locally-cached bare clone of the space.
 
         Resolution order — first one that exists / can be created wins:
@@ -385,13 +548,14 @@ class GitProviderViewSet(viewsets.ViewSet):
         from git_provider.worktree_manager import GitWorktreeManager
         from git_provider.providers.local_git import LocalGitProvider as _LG
         import logging
-        import os
         import subprocess
 
         log = logging.getLogger(__name__)
 
         try:
-            space = Space.objects.get(id=space_id)
+            if user is None:
+                return None
+            space = accessible_spaces_for_user(user).get(id=space_id)
         except (Space.DoesNotExist, ValueError):
             return None
 
@@ -418,42 +582,48 @@ class GitProviderViewSet(viewsets.ViewSet):
                     local_path = None
 
             # Final fallback — clone the upstream over HTTPS using the user's
-            # saved git token. The cache key is "blame.git" so it doesn't
-            # collide with the edit-fork bare clone above.
+            # active credential tuple. This prevents reuse across users and
+            # token rotation/revocation.
             if not local_path and space.git_repository_url:
-                blame_path = os.path.join(
-                    manager.cache_dir, 'spaces', str(space.id), 'blame.git',
-                )
-                if os.path.exists(blame_path):
+                credentials = _BlameClone.resolve_https_credentials(space, user)
+                blame_path = _BlameClone.cache_path(manager, space, user) if credentials else None
+                if blame_path and os.path.exists(blame_path):
                     try:
-                        manager._run_git_sync(
-                            ['fetch', '--all', '--prune'], cwd=blame_path,
-                        )
+                        env, askpass_path = _BlameClone.build_git_env(manager, credentials)
+                        try:
+                            subprocess.run(
+                                ['git', 'fetch', '--all', '--prune'],
+                                cwd=blame_path,
+                                env=env,
+                                capture_output=True,
+                                text=True,
+                                check=True,
+                                timeout=180,
+                            )
+                        finally:
+                            try:
+                                os.unlink(askpass_path)
+                            except OSError:
+                                pass
                     except Exception as e:
                         log.warning(
                             f"[Blame] Refresh of {blame_path} failed: {e}"
                         )
-                    local_path = blame_path
+                        local_path = None
+                    else:
+                        local_path = blame_path
                 else:
-                    auth_url = _BlameClone.with_auth(space)
-                    if auth_url:
+                    if credentials and blame_path:
                         try:
-                            os.makedirs(os.path.dirname(blame_path), exist_ok=True)
-                            manager._run_git_sync([
-                                'clone', '--bare', auth_url, blame_path,
-                            ], timeout=180)
-                            local_path = blame_path
+                            local_path = _BlameClone.clone_bare_repo(
+                                manager,
+                                credentials,
+                                blame_path,
+                            )
                         except Exception as e:
                             log.warning(
                                 f"[Blame] HTTPS clone for {space_id} failed: {e}"
                             )
-                            # Best-effort cleanup so the next attempt retries.
-                            try:
-                                if os.path.exists(blame_path):
-                                    import shutil
-                                    shutil.rmtree(blame_path)
-                            except Exception:
-                                pass
 
         if not local_path or not os.path.exists(local_path):
             return None

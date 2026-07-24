@@ -27,7 +27,11 @@ Test Strategy:
 - Test effective value computation
 """
 import pytest
+from unittest.mock import Mock, patch
+from rest_framework.test import APIRequestFactory, force_authenticate
 from wiki.models import Space, FileMapping
+from wiki.serializers import FileMappingCreateSerializer
+from wiki.views_file_mapping import FileMappingViewSet
 
 
 @pytest.mark.django_db
@@ -218,3 +222,199 @@ class TestFileMappingSync:
         
         file_mapping.refresh_from_db()
         assert file_mapping.effective_display_name_source == 'first_h2'
+
+    def test_sync_uses_provider_directory_tree_api(self, user, space):
+        """Sync should call get_directory_tree with provider-aware coordinates."""
+        user.userprofile.role = 'commenter'
+        user.userprofile.save()
+        space.git_provider = 'github'
+        space.git_base_url = 'https://api.github.com'
+        space.git_repository_id = 'octo/repo'
+        space.git_default_branch = 'main'
+        space.save()
+        FileMapping.objects.create(space=space, file_path='docs/old.md', is_folder=False)
+
+        provider = Mock()
+        provider.get_directory_tree.return_value = [{'path': 'docs/current.md', 'type': 'file'}]
+
+        request = APIRequestFactory().post('/sync')
+        force_authenticate(request, user=user)
+        view = FileMappingViewSet.as_view({'post': 'sync'})
+
+        with patch.object(FileMappingViewSet, '_get_git_provider', return_value=provider):
+            response = view(request, space_slug=space.slug)
+
+        assert response.status_code == 200
+        provider.get_directory_tree.assert_called_once_with(
+            project_key='octo',
+            repo_slug='repo',
+            path='',
+            branch='main',
+            recursive=True,
+        )
+        assert response.data['deleted_count'] == 1
+
+    def test_sync_uses_master_fallback_for_blank_bitbucket_default_branch(self, user, space):
+        user.userprofile.role = 'commenter'
+        user.userprofile.save()
+        space.git_provider = 'bitbucket_server'
+        space.git_base_url = 'https://bitbucket.example.com'
+        space.git_project_key = 'PRJ'
+        space.git_repository_id = 'repo'
+        space.git_default_branch = ''
+        space.save()
+
+        provider = Mock()
+        provider.get_directory_tree.return_value = [{'path': 'docs/current.md', 'type': 'file'}]
+
+        request = APIRequestFactory().post('/sync')
+        force_authenticate(request, user=user)
+        view = FileMappingViewSet.as_view({'post': 'sync'})
+
+        with patch.object(FileMappingViewSet, '_get_git_provider', return_value=provider):
+            response = view(request, space_slug=space.slug)
+
+        assert response.status_code == 200
+        provider.get_directory_tree.assert_called_once_with(
+            project_key='PRJ',
+            repo_slug='repo',
+            path='',
+            branch='master',
+            recursive=True,
+        )
+
+
+@pytest.mark.django_db
+class TestFileMappingCreateSerializerBranchFallback:
+    def test_create_serializer_uses_master_fallback_for_blank_bitbucket_default_branch(self, user, space):
+        space.git_provider = 'bitbucket_server'
+        space.git_base_url = 'https://bitbucket.example.com'
+        space.git_project_key = 'PRJ'
+        space.git_repository_id = 'repo'
+        space.git_default_branch = ''
+        space.save()
+
+        request = APIRequestFactory().post('/mappings')
+        request.user = user
+
+        provider = Mock()
+        provider.get_file_content.return_value = {'content': '# Heading'}
+
+        serializer = FileMappingCreateSerializer(
+            data={'file_path': 'docs/readme.md', 'is_folder': False, 'display_name_source': 'first_h1'},
+            context={'request': request},
+        )
+
+        with patch('wiki.serializers.GitProviderFactory.get_service_token', return_value=object()), patch(
+            'wiki.serializers.GitProviderFactory.create_from_service_token',
+            return_value=provider,
+        ):
+            assert serializer.is_valid(), serializer.errors
+            serializer.save(space=space, created_by=user)
+
+        provider.get_file_content.assert_called_once_with(
+            project_key='PRJ',
+            repo_slug='repo',
+            file_path='docs/readme.md',
+            branch='master',
+        )
+
+    def test_create_serializer_keeps_github_main_fallback(self, user, space):
+        space.git_provider = 'github'
+        space.git_base_url = 'https://api.github.com'
+        space.git_project_key = ''
+        space.git_repository_id = 'octo/repo'
+        space.git_repository_name = 'repo'
+        space.git_default_branch = ''
+        space.save()
+
+        request = APIRequestFactory().post('/mappings')
+        request.user = user
+
+        provider = Mock()
+        provider.get_file_content.return_value = {'content': '# Heading'}
+
+        serializer = FileMappingCreateSerializer(
+            data={'file_path': 'docs/readme.md', 'is_folder': False, 'display_name_source': 'first_h1'},
+            context={'request': request},
+        )
+
+        with patch('wiki.serializers.GitProviderFactory.get_service_token', return_value=object()), patch(
+            'wiki.serializers.GitProviderFactory.create_from_service_token',
+            return_value=provider,
+        ):
+            assert serializer.is_valid(), serializer.errors
+            serializer.save(space=space, created_by=user)
+
+        provider.get_file_content.assert_called_once_with(
+            project_key='octo',
+            repo_slug='repo',
+            file_path='docs/readme.md',
+            branch='main',
+        )
+
+
+@pytest.mark.django_db
+class TestFileMappingAccessControl:
+    def test_private_space_list_denies_unrelated_commenter(self, user, another_user):
+        another_user.userprofile.role = 'commenter'
+        another_user.userprofile.save()
+        space = Space.objects.create(
+            slug='private-space',
+            name='Private Space',
+            owner=user,
+            visibility='private',
+            git_provider='local_git',
+            git_base_url='/tmp/test-repo',
+            git_repository_id='test-repo',
+        )
+        FileMapping.objects.create(space=space, file_path='docs/readme.md', is_folder=False)
+
+        request = APIRequestFactory().get('/file-mappings/')
+        force_authenticate(request, user=another_user)
+        response = FileMappingViewSet.as_view({'get': 'list'})(request, space_slug=space.slug)
+
+        assert response.status_code == 404
+
+    def test_private_space_sync_denies_unrelated_commenter(self, user, another_user):
+        another_user.userprofile.role = 'commenter'
+        another_user.userprofile.save()
+        space = Space.objects.create(
+            slug='private-sync-space',
+            name='Private Sync Space',
+            owner=user,
+            visibility='private',
+            git_provider='github',
+            git_base_url='https://github.com',
+            git_repository_id='octo/repo',
+        )
+
+        request = APIRequestFactory().post('/sync')
+        force_authenticate(request, user=another_user)
+        response = FileMappingViewSet.as_view({'post': 'sync'})(request, space_slug=space.slug)
+
+        assert response.status_code == 404
+
+    def test_private_space_mapping_update_denies_unrelated_commenter(self, user, another_user):
+        another_user.userprofile.role = 'commenter'
+        another_user.userprofile.save()
+        space = Space.objects.create(
+            slug='private-mapping-space',
+            name='Private Mapping Space',
+            owner=user,
+            visibility='private',
+            git_provider='local_git',
+            git_base_url='/tmp/test-repo',
+            git_repository_id='test-repo',
+        )
+        mapping = FileMapping.objects.create(space=space, file_path='docs/readme.md', is_folder=False)
+
+        request = APIRequestFactory().put(
+            f'/file-mappings/{mapping.pk}/',
+            {'file_path': 'docs/readme.md', 'is_folder': False},
+            format='json',
+        )
+        force_authenticate(request, user=another_user)
+        response = FileMappingViewSet.as_view({'put': 'update'})(request, space_slug=space.slug, pk=mapping.pk)
+
+        assert response.status_code == 404

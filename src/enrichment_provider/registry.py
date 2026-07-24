@@ -10,6 +10,11 @@ from .diff_enrichment import DiffEnrichmentProvider
 from .edit_session_enrichment import EditEnrichmentProvider, CommitEnrichmentProvider
 
 
+def is_enrichment_configuration_error(exc: Exception) -> bool:
+    """Identify configuration errors that must reach the API caller."""
+    return isinstance(exc, ValueError) and 'service token configuration' in str(exc)
+
+
 class EnrichmentRegistry:
     """
     Registry for enrichment providers.
@@ -91,6 +96,8 @@ class EnrichmentRegistry:
                 enrichments = provider.get_enrichments(source_uri, user)
                 return enrichment_type, enrichments or []
             except Exception as e:
+                if is_enrichment_configuration_error(e):
+                    raise
                 logger.error(f"Error getting enrichments from {enrichment_type} provider: {e}", exc_info=True)
                 return enrichment_type, []
 
@@ -120,6 +127,8 @@ class EnrichmentRegistry:
             try:
                 return provider.get_enrichments(source_uri, user)
             except Exception as e:
+                if is_enrichment_configuration_error(e):
+                    raise
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.error(f"Error getting {enrichment_type} enrichments: {e}", exc_info=True)

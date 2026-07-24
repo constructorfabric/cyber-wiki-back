@@ -1,10 +1,9 @@
-"""
-Git-based source provider implementation.
-"""
+"""Git-based source provider implementation."""
 from typing import Dict, Any, List
-from .base import BaseSourceProvider, SourceAddress
+
 from git_provider.factory import GitProviderFactory
-from service_tokens.models import ServiceToken
+
+from .base import BaseSourceProvider, SourceAddress
 
 
 class GitSourceProvider(BaseSourceProvider):
@@ -23,19 +22,12 @@ class GitSourceProvider(BaseSourceProvider):
     
     def _get_git_provider(self, address: SourceAddress):
         """Get Git provider instance for the source address."""
-        try:
-            # Find matching ServiceToken for this provider and repository
-            service_token = ServiceToken.objects.filter(
-                user=self.user,
-                service_type=address.provider
-            ).first()
-            
-            if not service_token:
-                raise ValueError(f"No credentials found for provider: {address.provider}")
-            
-            return GitProviderFactory.create_from_service_token(service_token)
-        except ServiceToken.DoesNotExist:
-            raise ValueError(f"No credentials found for provider: {address.provider}")
+        service_token = GitProviderFactory.get_source_service_token(
+            user=self.user,
+            provider=address.provider,
+            base_url=address.base_url,
+        )
+        return GitProviderFactory.create_from_service_token(service_token)
     
     def get_content(self, address: SourceAddress) -> Dict[str, Any]:
         """
@@ -49,11 +41,18 @@ class GitSourceProvider(BaseSourceProvider):
         """
         provider = self._get_git_provider(address)
         
+        project_key, repo_slug = GitProviderFactory.get_repository_coordinates(
+            address.provider,
+            None,
+            address.repository,
+        )
+
         # Get file content from Git provider
         file_data = provider.get_file_content(
-            repo_id=address.repository,
+            project_key=project_key,
+            repo_slug=repo_slug,
             file_path=address.path,
-            branch=address.branch
+            branch=address.branch,
         )
         
         # If line range is specified, filter content
@@ -89,12 +88,19 @@ class GitSourceProvider(BaseSourceProvider):
         """
         provider = self._get_git_provider(address)
         
+        project_key, repo_slug = GitProviderFactory.get_repository_coordinates(
+            address.provider,
+            None,
+            address.repository,
+        )
+
         # Get directory tree from Git provider
         tree = provider.get_directory_tree(
-            repo_id=address.repository,
+            project_key=project_key,
+            repo_slug=repo_slug,
             path=address.path,
             branch=address.branch,
-            recursive=recursive
+            recursive=recursive,
         )
         
         # Add source URIs to each entry
@@ -103,7 +109,8 @@ class GitSourceProvider(BaseSourceProvider):
                 provider=address.provider,
                 repository=address.repository,
                 branch=address.branch,
-                path=entry['path']
+                path=entry['path'],
+                base_url=address.base_url,
             )
             entry['source_uri'] = entry_address.to_uri()
         

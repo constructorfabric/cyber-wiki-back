@@ -68,7 +68,7 @@ class SpaceViewSet(viewsets.ModelViewSet):
         tags=['spaces'],
     )
     def create(self, request):
-        serializer = SpaceDetailSerializer(data=request.data)
+        serializer = SpaceDetailSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         
         # Set owner and created_by to current user
@@ -80,7 +80,7 @@ class SpaceViewSet(viewsets.ModelViewSet):
         # Create default configuration
         SpaceConfiguration.objects.create(space=space)
         
-        response_serializer = SpaceDetailSerializer(space)
+        response_serializer = SpaceDetailSerializer(space, context={'request': request})
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
     
     @extend_schema(
@@ -114,7 +114,7 @@ class SpaceViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
         
-        serializer = SpaceDetailSerializer(space, data=request.data, partial=partial)
+        serializer = SpaceDetailSerializer(space, data=request.data, partial=partial, context={'request': request})
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)

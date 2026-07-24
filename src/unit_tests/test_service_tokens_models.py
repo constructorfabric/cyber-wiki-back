@@ -28,9 +28,15 @@ Test Strategy:
 - Use shared fixtures from conftest.py
 - Verify string representations
 """
+import importlib
 import pytest
+from django.apps import apps as django_apps
 from django.db import IntegrityError
 from service_tokens.models import ServiceToken, ServiceType
+
+normalize_github_base_urls_migration = importlib.import_module(
+    'service_tokens.migrations.0008_normalize_github_base_urls'
+)
 
 
 @pytest.mark.django_db
@@ -50,7 +56,7 @@ class TestServiceToken:
         
         assert token.user == user
         assert token.service_type == ServiceType.GITHUB
-        assert token.base_url == 'https://github.com'
+        assert token.base_url == 'https://api.github.com'
         assert token.get_token() == 'ghp_test_token_123'
         assert token.get_username() == 'testuser@github'
     
@@ -115,9 +121,31 @@ class TestServiceToken:
         
         # Verify encrypted token is different from original
         assert token.encrypted_token != original_token
-        
+
         # Verify decryption returns original
         assert token.get_token() == original_token
+
+    def test_save_normalizes_github_enterprise_root_to_api_v3(self, user):
+        token = ServiceToken.objects.create(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://ghe.example.com'
+        )
+        token.set_token('ghp-enterprise-token')
+        token.save()
+
+        assert token.base_url == 'https://ghe.example.com/api/v3'
+
+    def test_save_normalizes_github_api_host_casing_and_trailing_slash(self, user):
+        token = ServiceToken.objects.create(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='HTTPS://API.GITHUB.COM/',
+        )
+        token.set_token('ghp-public-token')
+        token.save()
+
+        assert token.base_url == 'https://api.github.com'
     
     def test_username_encryption_decryption(self, user):
         """Test username encryption and decryption round-trip."""
@@ -160,7 +188,7 @@ class TestServiceToken:
         token.set_token('token')
         token.save()
         
-        assert str(token) == 'testuser - github - https://github.com'
+        assert str(token) == 'testuser - github - https://api.github.com'
     
     def test_string_representation_custom_header_with_name(self, user):
         """Test string representation for custom header token with name."""
@@ -203,7 +231,7 @@ class TestServiceToken:
             token2 = ServiceToken.objects.create(
                 user=user,
                 service_type=ServiceType.GITHUB,
-                base_url='https://github.com'
+                base_url='https://api.github.com'
             )
             token2.set_token('token2')
             token2.save()
@@ -294,3 +322,96 @@ class TestServiceToken:
         
         for expected in expected_types:
             assert expected in actual_types
+
+    def test_migration_normalizes_existing_github_web_urls_and_deduplicates_collisions(self, user):
+        root_token = ServiceToken(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://github.com',
+            encrypted_token='placeholder',
+        )
+        root_token.set_token('ghp-shared-token')
+        api_token = ServiceToken(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://api.github.com',
+            encrypted_token='placeholder',
+        )
+        api_token.set_token('ghp-shared-token')
+        ServiceToken.objects.bulk_create([root_token, api_token])
+
+        normalize_github_base_urls_migration.forwards(apps=django_apps, schema_editor=None)
+
+        tokens = list(
+            ServiceToken.objects.filter(user=user, service_type=ServiceType.GITHUB).order_by('pk')
+        )
+        assert len(tokens) == 1
+        assert tokens[0].base_url == 'https://api.github.com'
+
+    def test_migration_prefers_validated_populated_survivor_over_empty_canonical_row(self, user):
+        canonical_token = ServiceToken(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://api.github.com',
+            encrypted_token='placeholder',
+            last_validation_valid=False,
+        )
+        canonical_token.set_token('ghp-working-token')
+        root_token = ServiceToken(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://github.com',
+            encrypted_token='placeholder',
+            last_validation_valid=True,
+            last_validation_message='ok',
+        )
+        root_token.set_token('ghp-working-token')
+        root_token.set_username('octocat')
+        ServiceToken.objects.bulk_create([canonical_token, root_token])
+
+        normalize_github_base_urls_migration.forwards(apps=django_apps, schema_editor=None)
+
+        tokens = list(ServiceToken.objects.filter(user=user, service_type=ServiceType.GITHUB))
+        assert len(tokens) == 1
+        survivor = tokens[0]
+        assert survivor.base_url == 'https://api.github.com'
+        assert survivor.get_token() == 'ghp-working-token'
+        assert survivor.get_username() == 'octocat'
+        assert survivor.last_validation_valid is True
+        assert survivor.last_validation_message == 'ok'
+
+    def test_migration_fails_closed_on_materially_different_duplicate_tokens(self, user):
+        root_token = ServiceToken(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://github.com',
+            encrypted_token='placeholder',
+        )
+        root_token.set_token('ghp-root-token')
+
+        api_token = ServiceToken(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://api.github.com',
+            encrypted_token='placeholder',
+        )
+        api_token.set_token('ghp-api-token')
+        ServiceToken.objects.bulk_create([root_token, api_token])
+
+        with pytest.raises(RuntimeError, match='Manual ServiceToken deduplication required'):
+            normalize_github_base_urls_migration.forwards(apps=django_apps, schema_editor=None)
+
+    def test_migration_normalizes_existing_ghe_root_url_to_api_v3(self, user):
+        token = ServiceToken(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://ghe.example.com',
+            encrypted_token='placeholder',
+        )
+        token.set_token('ghp-ghe-token')
+        ServiceToken.objects.bulk_create([token])
+
+        normalize_github_base_urls_migration.forwards(apps=django_apps, schema_editor=None)
+
+        token.refresh_from_db()
+        assert token.base_url == 'https://ghe.example.com/api/v3'

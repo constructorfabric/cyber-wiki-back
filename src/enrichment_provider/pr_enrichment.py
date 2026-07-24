@@ -1,6 +1,4 @@
-"""
-Pull request enrichment provider.
-"""
+"""Pull request enrichment provider."""
 import logging
 import re
 import time
@@ -10,7 +8,6 @@ from typing import List, Dict, Any
 from .base import BaseEnrichmentProvider, EnrichmentCategory
 from source_provider.base import SourceAddress
 from git_provider.factory import GitProviderFactory
-from service_tokens.models import ServiceToken
 
 _HUNK_HEADER_RE = re.compile(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
 
@@ -22,6 +19,18 @@ class PREnrichmentProvider(BaseEnrichmentProvider):
     Provides PR diffs as enrichments for files that have open PRs.
     """
     
+    @staticmethod
+    def _get_source_address_and_provider(source_uri: str, user):
+        """Build the provider for a source URI using the canonical token flow."""
+        address = SourceAddress.parse(source_uri)
+        service_token = GitProviderFactory.get_source_service_token(
+            user=user,
+            provider=address.provider,
+            base_url=address.base_url,
+        )
+        provider = GitProviderFactory.create_from_service_token(service_token)
+        return address, provider
+
     def get_enrichments(self, source_uri: str, user) -> List[Dict[str, Any]]:
         """
         Get PR enrichments for a source URI.
@@ -37,27 +46,22 @@ class PREnrichmentProvider(BaseEnrichmentProvider):
         try:
             # Parse source address
             parse_start = time.time()
-            address = SourceAddress.parse(source_uri)
+            address, provider = self._get_source_address_and_provider(source_uri, user)
             logger.debug(f"[PR] Parse URI took {time.time() - parse_start:.3f}s")
-            
+
             # Get Git provider
             token_start = time.time()
-            service_token = ServiceToken.objects.filter(
-                user=user,
-                service_type=address.provider
-            ).first()
-            
-            if not service_token:
-                logger.debug(f"[PR] No service token for {address.provider}")
-                return []
-            
-            provider = GitProviderFactory.create_from_service_token(service_token)
             logger.debug(f"[PR] Get provider took {time.time() - token_start:.3f}s")
+            repo_id = GitProviderFactory.build_repository_identity(
+                address.provider,
+                None,
+                address.repository,
+            )
             
             # Get ALL open PRs for this repository
             list_start = time.time()
             prs_response = provider.list_pull_requests(
-                repo_id=address.repository,
+                repo_id=repo_id,
                 state='open',
                 page=1,
                 per_page=1000  # Fetch all open PRs (most repos have < 1000 open PRs)
@@ -78,7 +82,7 @@ class PREnrichmentProvider(BaseEnrichmentProvider):
                 try:
                     pr_file_start = time.time()
                     diff_text = provider.get_pull_request_diff(
-                        repo_id=address.repository,
+                        repo_id=repo_id,
                         pr_number=pr['number']
                     )
                     if not diff_text:
@@ -133,6 +137,8 @@ class PREnrichmentProvider(BaseEnrichmentProvider):
             return enrichments
         
         except Exception as e:
+            if isinstance(e, ValueError) and 'service token configuration' in str(e):
+                raise
             logger.error(f"Failed to get PR enrichments: {e}")
             return []
     
@@ -236,17 +242,14 @@ class PREnrichmentProvider(BaseEnrichmentProvider):
         """
         start_time = time.time()
         try:
-            address = SourceAddress.parse(source_uri)
-            service_token = ServiceToken.objects.filter(
-                user=user, service_type=address.provider
-            ).first()
-            if not service_token:
-                yield {'type': 'result', 'data': []}
-                return
-
-            provider = GitProviderFactory.create_from_service_token(service_token)
+            address, provider = self._get_source_address_and_provider(source_uri, user)
+            repo_id = GitProviderFactory.build_repository_identity(
+                address.provider,
+                None,
+                address.repository,
+            )
             prs_response = provider.list_pull_requests(
-                repo_id=address.repository, state='open', page=1, per_page=1000
+                repo_id=repo_id, state='open', page=1, per_page=1000
             )
             prs = prs_response.get('pull_requests', [])
             file_name = address.path.split('/')[-1]
@@ -261,7 +264,7 @@ class PREnrichmentProvider(BaseEnrichmentProvider):
 
                 try:
                     diff_text = provider.get_pull_request_diff(
-                        repo_id=address.repository, pr_number=pr['number']
+                        repo_id=repo_id, pr_number=pr['number']
                     )
                     if not diff_text:
                         continue

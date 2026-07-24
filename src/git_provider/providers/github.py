@@ -1,9 +1,13 @@
 """
 GitHub provider implementation.
 """
+import base64
+import binascii
 import requests
+from urllib.parse import quote, urlparse
 from typing import List, Dict, Any, Optional
 from ..base import BaseGitProvider
+from service_tokens.url import normalize_service_base_url
 
 
 class GitHubProvider(BaseGitProvider):
@@ -13,8 +17,80 @@ class GitHubProvider(BaseGitProvider):
     Documentation: https://docs.github.com/en/rest
     """
     
+    @staticmethod
+    def _strip_terminal_dot_git(value: str) -> str:
+        """Remove a single terminal `.git` suffix from persisted GitHub IDs."""
+        return value[:-4] if value.endswith('.git') else value
+
+    @staticmethod
+    def normalize_base_url(base_url: str = '') -> str:
+        """Normalize GitHub API base URLs to the canonical API origin."""
+        return normalize_service_base_url('github', base_url)
+
+    @staticmethod
+    def parse_repository_url(url: str) -> Dict[str, Optional[str]]:
+        """Parse a GitHub repository/clone URL into canonical coordinates."""
+        repo_path = ''
+        base_url = ''
+
+        if url.startswith('git@'):
+            host, _, path = url[4:].partition(':')
+            repo_path = path.strip('/')
+            base_url = GitHubProvider.normalize_base_url(f'https://{host}')
+        else:
+            parsed = urlparse(url)
+            repo_path = parsed.path.strip('/')
+            if parsed.hostname:
+                scheme = 'https' if parsed.scheme == 'ssh' else (parsed.scheme or 'https')
+                base_url = GitHubProvider.normalize_base_url(
+                    f'{scheme}://{parsed.hostname}'
+                )
+
+        repo_path = GitHubProvider._strip_terminal_dot_git(repo_path)
+
+        parts = [part for part in repo_path.split('/') if part]
+        if len(parts) < 2:
+            raise ValueError(f'Invalid GitHub repository URL: {url}')
+
+        owner, repo = parts[0], parts[1]
+        return {
+            'git_base_url': base_url or GitHubProvider.normalize_base_url(),
+            'git_project_key': None,
+            'git_repository_id': f'{owner}/{repo}',
+            'git_repository_name': repo,
+        }
+
+    @staticmethod
+    def split_repository_coordinates(project_key: str, repo_slug: str) -> tuple[str, str]:
+        """Resolve GitHub owner/repo coordinates from current or legacy inputs."""
+        project_key = GitHubProvider._strip_terminal_dot_git(project_key or '')
+        repo_slug = GitHubProvider._strip_terminal_dot_git(repo_slug or '')
+        if repo_slug and '/' in repo_slug:
+            return repo_slug.split('/', 1)
+        if project_key and repo_slug:
+            return project_key, repo_slug
+        if repo_slug and '_' in repo_slug:
+            return repo_slug.split('_', 1)
+        return project_key, repo_slug
+
+    @staticmethod
+    def build_repo_id(project_key: str, repo_slug: str) -> str:
+        """Build the GitHub `owner/repo` identifier without double slashes."""
+        project_key = GitHubProvider._strip_terminal_dot_git(project_key or '')
+        repo_slug = GitHubProvider._strip_terminal_dot_git(repo_slug or '')
+        if repo_slug and '/' in repo_slug:
+            return repo_slug
+        if project_key:
+            return f"{project_key}/{repo_slug}"
+        return repo_slug
+
+    @staticmethod
+    def _normalize_requested_path(path: str) -> str:
+        """Normalize subtree requests to a repo-relative path prefix."""
+        return path.strip('/')
+
     def __init__(self, base_url: str = 'https://api.github.com', token: str = '', username: Optional[str] = None, user=None):
-        super().__init__(base_url, token, username, user)
+        super().__init__(self.normalize_base_url(base_url), token, username, user)
         self.headers = {
             'Authorization': f'Bearer {token}',
             'Accept': 'application/vnd.github.v3+json',
@@ -79,13 +155,22 @@ class GitHubProvider(BaseGitProvider):
     
     def get_file_content(self, project_key: str, repo_slug: str, file_path: str, branch: str = 'main') -> Dict[str, Any]:
         """Get file content from repository."""
-        repo_id = f"{project_key}/{repo_slug}"
+        repo_id = self.build_repo_id(project_key, repo_slug)
         response = self._request('GET', f'/repos/{repo_id}/contents/{file_path}', params={'ref': branch})
         data = response.json()
+        content = data.get('content', '')
+        encoding = data.get('encoding', 'base64')
+
+        if encoding == 'base64' and content:
+            try:
+                content = base64.b64decode(content).decode('utf-8')
+                encoding = 'utf-8'
+            except (ValueError, UnicodeDecodeError, binascii.Error):
+                pass
         
         return {
-            'content': data.get('content', ''),
-            'encoding': data.get('encoding', 'base64'),
+            'content': content,
+            'encoding': encoding,
             'sha': data.get('sha', ''),
             'size': data.get('size', 0),
             'path': data.get('path', file_path),
@@ -93,12 +178,21 @@ class GitHubProvider(BaseGitProvider):
     
     def get_directory_tree(self, project_key: str, repo_slug: str, path: str = '', branch: str = 'main', recursive: bool = False) -> List[Dict[str, Any]]:
         """Get directory tree."""
-        repo_id = f"{project_key}/{repo_slug}"
+        repo_id = self.build_repo_id(project_key, repo_slug)
         if recursive:
             # Use Git Trees API for recursive listing
-            response = self._request('GET', f'/repos/{repo_id}/git/trees/{branch}', params={'recursive': '1'})
+            encoded_branch = quote(branch, safe='')
+            response = self._request('GET', f'/repos/{repo_id}/git/trees/{encoded_branch}', params={'recursive': '1'})
             tree = response.json().get('tree', [])
-            return [self._normalize_tree_entry(entry) for entry in tree]
+            normalized_path = self._normalize_requested_path(path)
+            normalized_tree = [self._normalize_tree_entry(entry) for entry in tree]
+            if not normalized_path:
+                return normalized_tree
+            subtree_prefix = f'{normalized_path}/'
+            return [
+                entry for entry in normalized_tree
+                if entry.get('path') == normalized_path or entry.get('path', '').startswith(subtree_prefix)
+            ]
         else:
             # Use Contents API for single directory
             endpoint = f'/repos/{repo_id}/contents/{path}' if path else f'/repos/{repo_id}/contents'
@@ -283,9 +377,14 @@ class GitHubProvider(BaseGitProvider):
     
     def _normalize_tree_entry(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize tree entry."""
+        entry_type = entry.get('type', 'file')
+        if entry_type == 'blob':
+            entry_type = 'file'
+        elif entry_type == 'tree':
+            entry_type = 'dir'
         return {
             'path': entry.get('path', ''),
-            'type': entry.get('type', 'file'),
+            'type': entry_type,
             'size': entry.get('size', 0),
             'sha': entry.get('sha', ''),
         }

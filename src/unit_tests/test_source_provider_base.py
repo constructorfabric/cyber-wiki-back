@@ -173,15 +173,136 @@ class TestSourceAddress:
         
         assert addr.path == "config.test.js"
     
-    def test_parse_branch_with_slashes(self):
-        """Test parsing branch name with slashes (feature branches)."""
-        uri = "git://github/repo/feature/new-feature/README.md"
+    def test_parse_pre_query_canonical_github_uri_with_common_branch_name(self):
+        uri = "git://github/octo/repo/main/docs/readme.md"
         addr = SourceAddress.parse(uri)
-        
-        # Note: This will parse 'feature' as branch and 'new-feature/README.md' as path
-        # This is expected behavior based on the current regex
-        assert addr.branch == "feature"
-        assert addr.path == "new-feature/README.md"
+
+        assert addr.repository == "octo/repo"
+        assert addr.branch == "main"
+        assert addr.path == "docs/readme.md"
+
+    def test_parse_plain_legacy_github_repo_branch_path_without_regression(self):
+        uri = "git://github/repo/main/docs/readme.md"
+        addr = SourceAddress.parse(uri)
+
+        assert addr.repository == "repo"
+        assert addr.branch == "main"
+        assert addr.path == "docs/readme.md"
+
+    def test_parse_canonical_github_owner_repo_uri_with_ref_query(self):
+        uri = "git://github/octo/repo/docs/readme.md?ref=main"
+        addr = SourceAddress.parse(uri)
+
+        assert addr.provider == "github"
+        assert addr.repository == "octo/repo"
+        assert addr.branch == "main"
+        assert addr.path == "docs/readme.md"
+
+    def test_parse_github_uri_with_query_ref_supports_slash_branch(self):
+        uri = "git://github/octo/repo/docs/readme.md?ref=feature%2Fnew-ui"
+        addr = SourceAddress.parse(uri)
+
+        assert addr.repository == "octo/repo"
+        assert addr.branch == "feature/new-ui"
+        assert addr.path == "docs/readme.md"
+
+    def test_parse_canonical_github_repo_root_uri(self):
+        uri = "git://github/octo/repo?ref=main"
+        addr = SourceAddress.parse(uri)
+
+        assert addr.repository == "octo/repo"
+        assert addr.branch == "main"
+        assert addr.path == ""
+
+    @pytest.mark.parametrize("branch", ["release-2026", "hotfix", "feature/new-ui"])
+    def test_canonical_github_repo_root_round_trips_without_branch_guessing(self, branch):
+        addr = SourceAddress(
+            provider="github",
+            repository="octo/repo",
+            branch=branch,
+            path="",
+        )
+
+        assert SourceAddress.parse(addr.to_uri()) == addr
+
+    def test_to_uri_uses_query_ref_for_github_slash_branches(self):
+        addr = SourceAddress(
+            provider="github",
+            repository="octo/repo",
+            branch="feature/new-ui",
+            path="docs/readme.md",
+        )
+
+        assert addr.to_uri() == "git://github/octo/repo/docs/readme.md?ref=feature%2Fnew-ui"
+
+    def test_to_uri_uses_query_ref_for_github_simple_branches_too(self):
+        addr = SourceAddress(
+            provider="github",
+            repository="octo/repo",
+            branch="main",
+            path="docs/readme.md",
+        )
+
+        assert addr.to_uri() == "git://github/octo/repo/docs/readme.md?ref=main"
+
+    def test_to_uri_uses_query_ref_for_github_repo_roots(self):
+        addr = SourceAddress(
+            provider="github",
+            repository="octo/repo",
+            branch="release-2026",
+            path="",
+        )
+
+        assert addr.to_uri() == "git://github/octo/repo?ref=release-2026"
+
+    def test_parse_github_uri_with_ref_and_base_url_query_context(self):
+        uri = "git://github/octo/repo/docs/readme.md?ref=feature%2Fnew-ui&base_url=https%3A%2F%2Fghe.example.com"
+        addr = SourceAddress.parse(uri)
+
+        assert addr.repository == "octo/repo"
+        assert addr.branch == "feature/new-ui"
+        assert addr.path == "docs/readme.md"
+        assert addr.base_url == "https://ghe.example.com"
+
+    def test_parse_for_github_context_supports_persisted_old_canonical_anybranch_uri(self):
+        uri = "git://github/octo/repo/release2026/docs/readme.md"
+
+        addr = SourceAddress.parse_for_github_context(
+            uri,
+            repository="octo/repo",
+            branch="release2026",
+        )
+
+        assert addr.repository == "octo/repo"
+        assert addr.branch == "release2026"
+        assert addr.path == "docs/readme.md"
+
+    def test_parse_for_github_context_does_not_break_plain_legacy_repo_branch_path(self):
+        uri = "git://github/repo/release2026/docs/readme.md"
+
+        addr = SourceAddress.parse_for_github_context(
+            uri,
+            repository="octo/repo",
+            branch="release2026",
+        )
+
+        assert addr.repository == "repo"
+        assert addr.branch == "release2026"
+        assert addr.path == "docs/readme.md"
+
+    def test_to_uri_preserves_github_base_url_context(self):
+        addr = SourceAddress(
+            provider="github",
+            repository="octo/repo",
+            branch="feature/new-ui",
+            path="docs/readme.md",
+            base_url="https://ghe.example.com",
+        )
+
+        assert addr.to_uri() == (
+            "git://github/octo/repo/docs/readme.md"
+            "?ref=feature%2Fnew-ui&base_url=https%3A%2F%2Fghe.example.com"
+        )
 
 
 class TestBaseSourceProvider:

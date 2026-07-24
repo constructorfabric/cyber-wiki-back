@@ -49,6 +49,17 @@ class SourceAddress:
         ))
 
     @staticmethod
+    def _looks_like_arbitrary_legacy_canonical_github_uri(parts: List[str]) -> bool:
+        """
+        Safely detect persisted pre-query `owner/repo/branch/path` GitHub URIs.
+
+        Requiring an extra path segment preserves compatibility with the legacy
+        `repo/branch/path` form, while still rescuing the stored canonical
+        `owner/repo/arbitrary-branch/nested/path` shape.
+        """
+        return len(parts) >= 6
+
+    @staticmethod
     def _parse_line_fragment(uri: str) -> tuple[str, Optional[int], Optional[int]]:
         """Split `#start[-end]` from a source URI."""
         line_start = None
@@ -156,6 +167,10 @@ class SourceAddress:
                 repository = '/'.join(parts[1:3])
                 branch = unquote(query['ref'][0])
                 path = '/'.join(parts[3:])
+            elif cls._looks_like_arbitrary_legacy_canonical_github_uri(parts):
+                repository = '/'.join(parts[1:3])
+                branch = parts[3]
+                path = '/'.join(parts[4:])
             elif len(parts) >= 4 and cls._looks_like_legacy_canonical_github_branch(parts[3]):
                 repository = '/'.join(parts[1:3])
                 branch = parts[3]

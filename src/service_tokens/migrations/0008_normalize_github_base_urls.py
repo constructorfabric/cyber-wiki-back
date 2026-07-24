@@ -54,6 +54,9 @@ def _material_conflicts(tokens):
 
 def _pick_survivor(tokens, normalized_base_url):
     """Prefer a validated, populated row before canonical/oldest tie-breakers."""
+    def _timestamp_or_zero(value):
+        return value.timestamp() if value else 0
+
     return sorted(
         tokens,
         key=lambda token: (
@@ -62,14 +65,17 @@ def _pick_survivor(tokens, normalized_base_url):
             not bool(token.encrypted_username),
             token.base_url != normalized_base_url,
             token.last_validated_at is None,
-            -(token.last_validated_at.timestamp()) if token.last_validated_at else 0,
-            token.created_at or '',
+            -_timestamp_or_zero(token.last_validated_at),
+            _timestamp_or_zero(token.created_at),
             str(token.pk),
         ),
     )[0]
 
 
 def _merge_survivor_fields(survivor, tokens, normalized_base_url):
+    def _timestamp_or_zero(value):
+        return value.timestamp() if value else 0
+
     materials = {token.pk: _token_material(token) for token in tokens}
     token_plaintext = next(
         (materials[token.pk]['token'] for token in tokens if materials[token.pk]['token']),
@@ -84,7 +90,15 @@ def _merge_survivor_fields(survivor, tokens, normalized_base_url):
         None,
     )
     latest_validation = next(
-        (token for token in sorted(tokens, key=lambda token: token.last_validated_at or '', reverse=True) if token.last_validated_at),
+        (
+            token
+            for token in sorted(
+                tokens,
+                key=lambda token: _timestamp_or_zero(token.last_validated_at),
+                reverse=True,
+            )
+            if token.last_validated_at
+        ),
         None,
     )
 

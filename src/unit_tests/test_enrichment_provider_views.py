@@ -1,9 +1,10 @@
+import json
 from unittest.mock import Mock, patch
 
 import pytest
 from rest_framework.test import APIRequestFactory
 
-from enrichment_provider.views import _get_recursive_enrichments, _get_space_enrichments, get_enrichments
+from enrichment_provider.views import _get_recursive_enrichments, _get_space_enrichments, get_enrichments, stream_enrichments
 from wiki.models import FileComment
 from service_tokens.models import ServiceToken, ServiceType
 from unit_tests.test_helpers import create_test_space
@@ -257,6 +258,47 @@ def test_recursive_enrichments_supports_slash_branch_and_repo_root(user):
         'git://github/octo/repo/docs/readme.md?ref=feature%2Fnew-ui',
         user,
     )
+
+
+@pytest.mark.django_db
+def test_get_enrichments_returns_400_for_missing_github_token_with_actionable_message(user):
+    request = APIRequestFactory().get(
+        '/api/enrichments/v1/enrichments/',
+        {'source_uri': 'git://github/octo/repo/docs/readme.md?ref=main'},
+    )
+    request.user = user
+
+    response = get_enrichments(request)
+
+    assert response.status_code == 400
+    assert response.data == {
+        'error': (
+            'No service token found for provider: github. '
+            'Add a matching service token or include the correct base_url in the source URI.'
+        )
+    }
+
+
+@pytest.mark.django_db
+def test_stream_enrichments_surfaces_missing_github_token_and_does_not_complete(user):
+    request = APIRequestFactory().get(
+        '/api/enrichments/v1/enrichments/stream/',
+        {'source_uri': 'git://github/octo/repo/docs/readme.md?ref=main'},
+    )
+    request.user = user
+
+    response = stream_enrichments(request)
+    events = [json.loads(chunk) for chunk in response.streaming_content]
+
+    assert events == [
+        {
+            'type': 'error',
+            'message': (
+                'No service token found for provider: github. '
+                'Add a matching service token or include the correct base_url in the source URI.'
+            ),
+        }
+    ]
 
 
 @pytest.mark.django_db

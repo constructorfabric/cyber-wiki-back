@@ -277,6 +277,15 @@ class TestSourceAddress:
         assert addr.branch == "release2026"
         assert addr.path == "docs/readme.md"
 
+    def test_parse_supports_persisted_old_canonical_anybranch_uri_with_nested_path(self):
+        uri = "git://github/octo/repo/release2026/docs/readme.md"
+
+        addr = SourceAddress.parse(uri)
+
+        assert addr.repository == "octo/repo"
+        assert addr.branch == "release2026"
+        assert addr.path == "docs/readme.md"
+
     def test_parse_for_github_context_does_not_break_plain_legacy_repo_branch_path(self):
         uri = "git://github/repo/release2026/docs/readme.md"
 

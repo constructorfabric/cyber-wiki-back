@@ -67,7 +67,14 @@ def _space_enrichment_token_error_response(exc):
 
 def _file_enrichment_error_response(exc):
     if is_enrichment_configuration_error(exc):
-        return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        message = str(exc)
+        if message.startswith('No service token found for provider: '):
+            provider = message.rsplit(': ', 1)[-1]
+            message = (
+                f'No service token found for provider: {provider}. '
+                'Add a matching service token or include the correct base_url in the source URI.'
+            )
+        return Response({'error': message}, status=status.HTTP_400_BAD_REQUEST)
     return None
 
 
@@ -670,6 +677,14 @@ def stream_enrichments(request):
         from .comment_enrichment import CommentEnrichmentProvider
         from .edit_session_enrichment import EditEnrichmentProvider, CommitEnrichmentProvider
 
+        try:
+            _preflight_file_enrichment_provider_access(source_uri, request.user, enrichment_type='pr_diff')
+        except ValueError as exc:
+            error_response = _file_enrichment_error_response(exc)
+            message = error_response.data['error'] if error_response is not None else str(exc)
+            yield json.dumps({'type': 'error', 'message': message}) + '\n'
+            return
+
         # Fast enrichments first (DB / local git — typically < 0.5s total).
         yield json.dumps({'type': 'progress', 'message': 'Loading annotations…'}) + '\n'
         comments, edits, commits = [], [], []
@@ -688,13 +703,20 @@ def stream_enrichments(request):
 
         # Slow: stream PR enrichments with per-PR progress events.
         pr_enrichments = []
+        failed_closed = False
         for event in PREnrichmentProvider().get_enrichments_stream(source_uri, request.user):
             if event['type'] == 'result':
                 pr_enrichments = event['data']
             elif event['type'] == 'error':
                 logger.warning(f"[StreamEnrichments] PR stream error: {event.get('message')}")
+                failed_closed = True
+                yield json.dumps(event) + '\n'
+                break
             else:
                 yield json.dumps(event) + '\n'
+
+        if failed_closed:
+            return
 
         # Suppress commit enrichment when the branch already has an open PR
         # (the PR diff is a superset of the commit diff).

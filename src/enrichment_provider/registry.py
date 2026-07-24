@@ -12,7 +12,13 @@ from .edit_session_enrichment import EditEnrichmentProvider, CommitEnrichmentPro
 
 def is_enrichment_configuration_error(exc: Exception) -> bool:
     """Identify configuration errors that must reach the API caller."""
-    return isinstance(exc, ValueError) and 'service token configuration' in str(exc)
+    if not isinstance(exc, ValueError):
+        return False
+    message = str(exc)
+    return (
+        'service token configuration' in message
+        or 'No service token found for provider' in message
+    )
 
 
 class EnrichmentRegistry:

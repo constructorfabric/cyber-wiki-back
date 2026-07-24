@@ -32,6 +32,7 @@ import importlib
 import pytest
 from django.apps import apps as django_apps
 from django.db import IntegrityError
+from django.utils import timezone
 from service_tokens.models import ServiceToken, ServiceType
 
 normalize_github_base_urls_migration = importlib.import_module(
@@ -415,3 +416,30 @@ class TestServiceToken:
 
         token.refresh_from_db()
         assert token.base_url == 'https://ghe.example.com/api/v3'
+
+    def test_migration_handles_mixed_last_validated_at_values_without_type_errors(self, user):
+        stale_token = ServiceToken(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://github.com',
+            encrypted_token='placeholder',
+        )
+        stale_token.set_token('ghp-shared-token')
+        fresh_token = ServiceToken(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://api.github.com',
+            encrypted_token='placeholder',
+        )
+        fresh_token.set_token('ghp-shared-token')
+        fresh_token.last_validation_valid = True
+        ServiceToken.objects.bulk_create([stale_token, fresh_token])
+
+        fresh_token.last_validated_at = timezone.now()
+        fresh_token.save(update_fields=['last_validated_at'])
+
+        normalize_github_base_urls_migration.forwards(apps=django_apps, schema_editor=None)
+
+        tokens = list(ServiceToken.objects.filter(user=user, service_type=ServiceType.GITHUB))
+        assert len(tokens) == 1
+        assert tokens[0].base_url == 'https://api.github.com'

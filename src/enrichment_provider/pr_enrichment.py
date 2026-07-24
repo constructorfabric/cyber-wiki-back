@@ -14,6 +14,16 @@ _HUNK_HEADER_RE = re.compile(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
 logger = logging.getLogger(__name__)
 
 
+def _is_enrichment_configuration_error(exc: Exception) -> bool:
+    if not isinstance(exc, ValueError):
+        return False
+    message = str(exc)
+    return (
+        'service token configuration' in message
+        or 'No service token found for provider' in message
+    )
+
+
 class PREnrichmentProvider(BaseEnrichmentProvider):
     """
     Provides PR diffs as enrichments for files that have open PRs.
@@ -137,7 +147,7 @@ class PREnrichmentProvider(BaseEnrichmentProvider):
             return enrichments
         
         except Exception as e:
-            if isinstance(e, ValueError) and 'service token configuration' in str(e):
+            if _is_enrichment_configuration_error(e):
                 raise
             logger.error(f"Failed to get PR enrichments: {e}")
             return []
@@ -297,7 +307,8 @@ class PREnrichmentProvider(BaseEnrichmentProvider):
         except Exception as e:
             logger.error(f"[PR] Stream failed: {e}")
             yield {'type': 'error', 'message': str(e)}
-            yield {'type': 'result', 'data': []}
+            if not _is_enrichment_configuration_error(e):
+                yield {'type': 'result', 'data': []}
 
     def get_enrichment_type(self) -> str:
         return 'pr_diff'

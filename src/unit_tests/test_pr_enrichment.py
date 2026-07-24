@@ -239,5 +239,4 @@ def test_pr_enrichment_stream_fails_closed_when_github_source_tokens_are_ambiguo
             'type': 'error',
             'message': 'Ambiguous service token configuration for provider: github',
         },
-        {'type': 'result', 'data': []},
     ]

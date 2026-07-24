@@ -38,6 +38,34 @@ def test_get_content_supports_canonical_github_owner_repo_source_uri(user):
 
 
 @pytest.mark.django_db
+def test_get_content_supports_old_canonical_github_anybranch_source_uri(user):
+    ServiceToken.objects.create(
+        user=user,
+        service_type=ServiceType.GITHUB,
+        base_url='https://api.github.com',
+    )
+    request = APIRequestFactory().get(
+        '/api/source/v1/content/',
+        {'uri': 'git://github/octo/repo/release2026/docs/readme.md'},
+    )
+    request.user = user
+
+    provider = Mock()
+    provider.get_file_content.return_value = {'content': 'hello', 'encoding': 'utf-8'}
+
+    with patch('source_provider.git_source.GitProviderFactory.create_from_service_token', return_value=provider):
+        response = get_content(request)
+
+    assert response.status_code == 200
+    provider.get_file_content.assert_called_once_with(
+        project_key='octo',
+        repo_slug='repo',
+        file_path='docs/readme.md',
+        branch='release2026',
+    )
+
+
+@pytest.mark.django_db
 def test_get_tree_supports_github_slash_branch_source_uri(user):
     ServiceToken.objects.create(
         user=user,

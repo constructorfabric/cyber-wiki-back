@@ -6,9 +6,8 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from drf_spectacular.utils import extend_schema, OpenApiParameter
-from django.shortcuts import get_object_or_404
-
 from .models import Space, FileMapping
+from .access import get_accessible_space_or_404, accessible_spaces_for_user
 from .serializers import FileMappingSerializer, FileMappingCreateSerializer
 from .services.file_mapping import FileMappingService
 from .services.name_extraction import NameExtractionService
@@ -39,11 +38,11 @@ class FileMappingViewSet(viewsets.ModelViewSet):
         # Both Space.git_base_url and ServiceToken.base_url are
         # canonicalised on save (service_tokens.url.canonical_base_url),
         # so this match doesn't need any fallback.
-        service_token = ServiceToken.objects.filter(
+        service_token = GitProviderFactory.get_service_token(
             user=self.request.user,
-            service_type=space.git_provider,
+            provider=space.git_provider,
             base_url=space.git_base_url,
-        ).first()
+        )
 
         if not service_token:
             raise ValueError(f"No credentials found for provider: {space.git_provider}")
@@ -54,13 +53,23 @@ class FileMappingViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         space_slug = self.kwargs.get('space_slug')
         if space_slug:
-            return FileMapping.objects.filter(space__slug=space_slug).select_related('space', 'parent_rule')
+            return FileMapping.objects.filter(
+                space__in=accessible_spaces_for_user(self.request.user),
+                space__slug=space_slug,
+            ).select_related('space', 'parent_rule')
         return FileMapping.objects.none()
+
+    def _get_space(self, space_slug: str) -> Space:
+        return get_accessible_space_or_404(self.request.user, space_slug)
     
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:
             return FileMappingCreateSerializer
         return FileMappingSerializer
+
+    @staticmethod
+    def _space_branch(space: Space) -> str:
+        return FileMappingService.get_space_branch(space)
     
     @extend_schema(
         operation_id='file_mappings_list',
@@ -73,6 +82,7 @@ class FileMappingViewSet(viewsets.ModelViewSet):
         tags=['file-mappings'],
     )
     def list(self, request, space_slug=None):
+        self._get_space(space_slug)
         queryset = self.get_queryset()
         serializer = self.serializer_class(queryset, many=True)
         return Response(serializer.data)
@@ -86,7 +96,7 @@ class FileMappingViewSet(viewsets.ModelViewSet):
         tags=['file-mappings'],
     )
     def create(self, request, space_slug=None):
-        space = get_object_or_404(Space, slug=space_slug)
+        space = self._get_space(space_slug)
         serializer = FileMappingCreateSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
 
@@ -153,7 +163,7 @@ class FileMappingViewSet(viewsets.ModelViewSet):
     )
     @action(detail=False, methods=['post'])
     def bulk_update(self, request, space_slug=None):
-        space = get_object_or_404(Space, slug=space_slug)
+        space = self._get_space(space_slug)
         mappings_data = request.data.get('mappings', [])
         
         results = FileMappingService.bulk_update_mappings(
@@ -182,7 +192,7 @@ class FileMappingViewSet(viewsets.ModelViewSet):
     )
     @action(detail=False, methods=['post'])
     def apply_folder_rule(self, request, space_slug=None):
-        space = get_object_or_404(Space, slug=space_slug)
+        space = self._get_space(space_slug)
         folder_path = request.data.get('folder_path')
         apply_to_children = request.data.get('apply_to_children', True)
         rule = request.data.get('rule', {})
@@ -232,7 +242,7 @@ class FileMappingViewSet(viewsets.ModelViewSet):
     )
     @action(detail=False, methods=['post'])
     def extract_names(self, request, space_slug=None):
-        space = get_object_or_404(Space, slug=space_slug)
+        space = self._get_space(space_slug)
         file_paths = request.data.get('file_paths', [])
         source = request.data.get('source', 'first_h1')
         
@@ -240,9 +250,13 @@ class FileMappingViewSet(viewsets.ModelViewSet):
         git_provider = self._get_git_provider(space)
         
         # Get repository info
-        project_key = space.git_project_key or ''
-        repo_slug = space.git_repository_id or space.git_repository_name or ''
-        branch = space.git_default_branch or 'main'
+        project_key, repo_slug = GitProviderFactory.get_repository_coordinates(
+            space.git_provider,
+            space.git_project_key,
+            space.git_repository_id,
+            space.git_repository_name,
+        )
+        branch = self._space_branch(space)
         
         # Extract names
         results = []
@@ -293,7 +307,7 @@ class FileMappingViewSet(viewsets.ModelViewSet):
     )
     @action(detail=False, methods=['get'])
     def get_tree(self, request, space_slug=None):
-        space = get_object_or_404(Space, slug=space_slug)
+        space = self._get_space(space_slug)
         mode = request.query_params.get('mode', 'dev')
         filters_str = request.query_params.get('filters', '')
         filters = [f.strip() for f in filters_str.split(',') if f.strip()]
@@ -347,15 +361,27 @@ class FileMappingViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'])
     def sync(self, request, space_slug=None):
         """Sync file mappings - remove deleted files, recompute effective values."""
-        space = get_object_or_404(Space, slug=space_slug)
+        space = self._get_space(space_slug)
         
         try:
             # Get git provider
             git_provider = self._get_git_provider(space)
             
             # Get actual files from repository
-            tree = git_provider.get_tree(space.git_repository_id, recursive=True)
-            actual_files = {item['path'] for item in tree}
+            project_key, repo_slug = GitProviderFactory.get_repository_coordinates(
+                space.git_provider,
+                space.git_project_key,
+                space.git_repository_id,
+                space.git_repository_name,
+            )
+            tree = git_provider.get_directory_tree(
+                project_key=project_key,
+                repo_slug=repo_slug,
+                path='',
+                branch=self._space_branch(space),
+                recursive=True,
+            )
+            actual_files = {item['path'] for item in tree if item.get('type') == 'file'}
             
             # Find and delete mappings for files that no longer exist
             mappings = FileMapping.objects.filter(space=space)
@@ -421,24 +447,20 @@ class FileMappingViewSet(viewsets.ModelViewSet):
         from .services.file_mapping import FileMappingService, EXTRACTABLE_EXTS, EXTRACTION_SOURCES
 
         logger = logging.getLogger(__name__)
-        space = get_object_or_404(Space, slug=space_slug)
+        space = self._get_space(space_slug)
 
         try:
             git_provider = self._get_git_provider(space)
 
             # Resolve repo coordinates the same way build_tree_with_mappings does
-            if space.git_project_key:
-                project_key = space.git_project_key
-                repo_slug = space.git_repository_id or space.git_repository_name or ''
-            elif space.git_repository_id and '/' in space.git_repository_id:
-                project_key, repo_slug = space.git_repository_id.split('/', 1)
-            elif space.git_repository_name and '/' in space.git_repository_name:
-                project_key, repo_slug = space.git_repository_name.split('/', 1)
-            else:
-                project_key = space.git_project_key or ''
-                repo_slug = space.git_repository_id or space.git_repository_name or ''
+            project_key, repo_slug = GitProviderFactory.get_repository_coordinates(
+                space.git_provider,
+                space.git_project_key,
+                space.git_repository_id,
+                space.git_repository_name,
+            )
 
-            branch = space.git_default_branch or 'main'
+            branch = self._space_branch(space)
 
             # Recursive tree from the repo root
             try:

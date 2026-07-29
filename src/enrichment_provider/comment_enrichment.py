@@ -3,6 +3,7 @@ Comment enrichment provider.
 """
 from typing import List, Dict, Any
 from .base import BaseEnrichmentProvider, EnrichmentCategory
+from source_provider.base import SourceAddress
 from wiki.models import FileComment
 
 
@@ -23,9 +24,11 @@ class CommentEnrichmentProvider(BaseEnrichmentProvider):
         Returns:
             List of root comment enrichments with nested replies
         """
-        # Get only root comments (no parent) for this source URI
+        address = SourceAddress.parse(source_uri)
+
+        # Match persisted legacy/comment-compatible URIs as the same file.
         root_comments = FileComment.objects.filter(
-            source_uri=source_uri,
+            source_uri__in=address.equivalent_comment_uris(),
             parent_comment=None
         ).select_related('author').prefetch_related('replies').order_by('line_start', 'created_at')
         
@@ -34,7 +37,7 @@ class CommentEnrichmentProvider(BaseEnrichmentProvider):
             data = {
                 'type': 'comment',
                 'id': str(comment.id),
-                'source_uri': comment.source_uri,
+                'source_uri': source_uri,
                 'line_start': comment.line_start,
                 'line_end': comment.line_end,
                 'text': comment.text,

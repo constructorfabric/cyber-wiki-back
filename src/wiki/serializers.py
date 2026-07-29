@@ -1,12 +1,18 @@
 """
 Serializers for wiki models.
 """
+import logging
+
 from rest_framework import serializers
+from git_provider.factory import GitProviderFactory
+from git_provider.providers.github import GitHubProvider
 from .models import (
     Space, Document, FileComment, UserChange, Tag, DocumentTag, DocumentLink, GitSyncConfig,
     SpacePermission, SpaceConfiguration, SpaceShortcut, UserSpacePreference, SpaceAttribute,
     FileMapping, EditSession
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SpaceDetailSerializer(serializers.ModelSerializer):
@@ -90,22 +96,15 @@ class SpaceDetailSerializer(serializers.ModelSerializer):
     def _parse_and_verify_git_url(self, url, provider):
         """Parse Git repository URL and extract details based on provider."""
         from urllib.parse import urlparse
-        
+
+        if provider == 'github':
+            return GitHubProvider.parse_repository_url(url)
+
         parsed_url = urlparse(url)
         hostname = parsed_url.hostname or ''
         path = parsed_url.path.strip('/')
-        
-        if provider == 'github':
-            base_url = f"{parsed_url.scheme}://{hostname}"
-            parts = path.split('/')
-            if len(parts) >= 2:
-                repo_id = f"{parts[0]}/{parts[1]}"
-                repo_name = parts[1]
-            else:
-                repo_id = path
-                repo_name = path
-            project_key = None
-        elif provider == 'bitbucket_server':
+
+        if provider == 'bitbucket_server':
             base_url = f"{parsed_url.scheme}://{hostname}"
             # Bitbucket Server URL format: /projects/PROJECT/repos/REPO
             if 'projects' in path and 'repos' in path:
@@ -136,33 +135,79 @@ class SpaceDetailSerializer(serializers.ModelSerializer):
             'git_repository_id': repo_id,
             'git_repository_name': repo_name,
         }
+
+    @staticmethod
+    def _default_branch_fallback(provider):
+        """Return the authoritative branch fallback for providers we support."""
+        return GitProviderFactory.default_branch_fallback(provider)
     
     def _detect_default_branch(self, provider, base_url, project_key, repo_id):
-        """Detect the default branch by fetching branches from the Git provider."""
+        """Detect the default branch using provider-compatible repository APIs."""
         try:
-            from git_provider.factory import GitProviderFactory
-            
-            # Get provider instance
-            git_provider = GitProviderFactory.get_provider(provider, base_url)
-            
-            # Construct full repo ID for Bitbucket
+            request = self.context.get('request')
+            user = getattr(request, 'user', None)
+            if not user or not getattr(user, 'is_authenticated', False):
+                logger.warning(
+                    'Skipping default branch autodetection for provider=%s repo_id=%s: no authenticated request user',
+                    provider,
+                    repo_id,
+                )
+                return self._default_branch_fallback(provider)
+
+            service_token = GitProviderFactory.get_service_token(
+                user=user,
+                provider=provider,
+                base_url=base_url,
+            )
+            if not service_token:
+                logger.warning(
+                    'Skipping default branch autodetection for provider=%s repo_id=%s: no service token',
+                    provider,
+                    repo_id,
+                )
+                return self._default_branch_fallback(provider)
+
+            git_provider = GitProviderFactory.create_from_service_token(service_token)
+            project_key, repo_slug = GitProviderFactory.get_repository_coordinates(
+                provider,
+                project_key,
+                repo_id,
+            )
+
+            if provider == 'github':
+                repository = git_provider.get_repository(f'{project_key}/{repo_slug}')
+                default_branch = repository.get('default_branch')
+                if default_branch:
+                    return default_branch
+
+                logger.warning(
+                    'GitHub default branch autodetection returned no default_branch for repo_id=%s',
+                    f'{project_key}/{repo_slug}',
+                )
+                return self._default_branch_fallback(provider)
+
             if provider == 'bitbucket_server' and project_key:
-                full_repo_id = f"{project_key}_{repo_id}"
-            else:
-                full_repo_id = repo_id
-            
-            # Fetch branches
-            branches = git_provider.list_branches(full_repo_id)
-            
-            # Return first branch (usually the default)
-            if branches:
-                return branches[0]
-            
-            # Fallback to common defaults
-            return 'master'
+                repository = git_provider.get_repository(f"{project_key}_{repo_slug}")
+                default_branch = repository.get('default_branch')
+                if default_branch:
+                    return default_branch
+
+                branches = git_provider.list_branches(project_key, repo_slug)
+                for branch in branches:
+                    if branch.get('is_default'):
+                        return branch.get('name')
+                if branches:
+                    return branches[0].get('name') or self._default_branch_fallback(provider)
+
+            return self._default_branch_fallback(provider)
         except Exception:
-            # If detection fails, use common default
-            return 'master'
+            logger.warning(
+                'Default branch autodetection failed for provider=%s repo_id=%s',
+                provider,
+                repo_id,
+                exc_info=True,
+            )
+            return self._default_branch_fallback(provider)
 
 
 class FileCommentSerializer(serializers.ModelSerializer):
@@ -445,11 +490,11 @@ class FileMappingCreateSerializer(serializers.ModelSerializer):
             # Token lookup is by exact (user, service_type, base_url) tuple
             # — both base_url columns are canonicalised on save, so no
             # fallback is needed.
-            service_token = ServiceToken.objects.filter(
+            service_token = GitProviderFactory.get_service_token(
                 user=request.user,
-                service_type=space.git_provider,
+                provider=space.git_provider,
                 base_url=space.git_base_url,
-            ).first()
+            )
 
             if not service_token:
                 logger.warning(f'[EXTRACT] No service token found for {space.git_provider}')
@@ -460,11 +505,17 @@ class FileMappingCreateSerializer(serializers.ModelSerializer):
             
             # Get file content
             logger.info(f'[EXTRACT] Fetching file content: project={space.git_project_key}, repo={space.git_repository_id}, path={mapping.file_path}, branch={space.git_default_branch}')
+            project_key, repo_slug = GitProviderFactory.get_repository_coordinates(
+                space.git_provider,
+                space.git_project_key,
+                space.git_repository_id,
+                space.git_repository_name,
+            )
             file_data = git_provider.get_file_content(
-                project_key=space.git_project_key or '',
-                repo_slug=space.git_repository_id or space.git_repository_name or '',
+                project_key=project_key,
+                repo_slug=repo_slug,
                 file_path=mapping.file_path,
-                branch=space.git_default_branch or 'main'
+                branch=space.git_default_branch or GitProviderFactory.default_branch_fallback(space.git_provider)
             )
             content = file_data.get('content', '')
             logger.info(f'[EXTRACT] Got content, length={len(content)}')
@@ -556,7 +607,9 @@ class EditSessionCreateSerializer(serializers.ModelSerializer):
             if space and space.git_default_branch:
                 validated_data['base_branch'] = space.git_default_branch
             else:
-                validated_data['base_branch'] = 'master'
+                validated_data['base_branch'] = GitProviderFactory.default_branch_fallback(
+                    space.git_provider if space else None
+                )
         
         return super().create(validated_data)
 

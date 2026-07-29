@@ -8,6 +8,7 @@ from django.db.models import Q
 from django.utils import timezone
 from wiki.models import Space, FileMapping
 from wiki.services.name_extraction import NameExtractionService
+from git_provider.factory import GitProviderFactory
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,11 @@ EXTRACTION_SOURCES = {'first_h1', 'first_h2', 'title_frontmatter'}
 
 class FileMappingService:
     """Business logic for file mappings."""
+
+    @staticmethod
+    def get_space_branch(space: Space) -> str:
+        """Resolve the effective branch for Git-backed file mapping operations."""
+        return space.git_default_branch or GitProviderFactory.default_branch_fallback(space.git_provider)
     
     @staticmethod
     def get_effective_mapping(space: Space, file_path: str) -> Optional[FileMapping]:
@@ -150,11 +156,17 @@ class FileMappingService:
             return name
 
         try:
+            project_key, repo_slug = GitProviderFactory.get_repository_coordinates(
+                space.git_provider,
+                space.git_project_key,
+                space.git_repository_id,
+                space.git_repository_name,
+            )
             file_data = git_provider.get_file_content(
-                project_key=space.git_project_key or '',
-                repo_slug=space.git_repository_id or space.git_repository_name or '',
+                project_key=project_key,
+                repo_slug=repo_slug,
                 file_path=file_path,
-                branch=space.git_default_branch or 'main',
+                branch=FileMappingService.get_space_branch(space),
             )
             content = file_data.get('content', '') if isinstance(file_data, dict) else ''
             extracted = NameExtractionService.extract_name(file_path, content, effective_source)
@@ -343,32 +355,14 @@ class FileMappingService:
         # For Bitbucket: project_key and repo_slug
         # For GitHub: project_key is owner, repo_slug is repo name
         
-        # Handle repository identification
-        if space.git_project_key:
-            # Explicit project key (Bitbucket Server)
-            project_key = space.git_project_key
-            repo_slug = space.git_repository_id or space.git_repository_name or ''
-        elif space.git_repository_id and '/' in space.git_repository_id:
-            # GitHub format "owner/repo" in repository_id
-            parts = space.git_repository_id.split('/', 1)
-            project_key = parts[0]
-            repo_slug = parts[1]
-        elif space.git_repository_id and '_' in space.git_repository_id:
-            # Repository ID in format "project_repo" (legacy)
-            parts = space.git_repository_id.split('_', 1)
-            project_key = parts[0]
-            repo_slug = parts[1]
-        elif space.git_repository_name and '/' in space.git_repository_name:
-            # GitHub format "owner/repo"
-            parts = space.git_repository_name.split('/', 1)
-            project_key = parts[0]
-            repo_slug = parts[1]
-        else:
-            # Fallback
-            project_key = space.git_project_key or ''
-            repo_slug = space.git_repository_id or space.git_repository_name or ''
+        project_key, repo_slug = GitProviderFactory.get_repository_coordinates(
+            space.git_provider,
+            space.git_project_key,
+            space.git_repository_id,
+            space.git_repository_name,
+        )
         
-        branch = space.git_default_branch or 'main'
+        branch = FileMappingService.get_space_branch(space)
         
         raw_tree = git_provider.get_directory_tree(
             project_key=project_key,

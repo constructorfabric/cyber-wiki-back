@@ -3,15 +3,22 @@ import logging
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from django.db.models import Q
+from django.http import Http404
 from django.http import StreamingHttpResponse
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
-from .registry import get_registry
+from git_provider.factory import GitProviderFactory
+from source_provider.base import SourceAddress
+from service_tokens.url import normalize_service_base_url
+from .registry import get_registry, is_enrichment_configuration_error
+from wiki.access import get_accessible_space_or_404
 from wiki.models import Space
 
 logger = logging.getLogger(__name__)
+_AMBIGUOUS_GITHUB_TOKEN_ERROR = 'Ambiguous service token configuration for provider: github'
 
 
 def _empty_file_enrichments():
@@ -23,6 +30,73 @@ def _ensure_file(file_enrichments, file_path):
         file_enrichments[file_path] = _empty_file_enrichments()
 
 
+def _normalize_comment_repository(provider, repository):
+    if provider == 'github' and repository.endswith('.git'):
+        repository = repository[:-4]
+    if provider == 'github' and '/' not in repository and '_' in repository:
+        owner, repo = repository.split('_', 1)
+        return f'{owner}/{repo}'
+    return repository
+
+
+def _comment_matches_space_base_url(provider, space_base_url, comment_base_url):
+    if provider != 'github':
+        return True
+    if not comment_base_url:
+        return True
+    return normalize_service_base_url(provider, comment_base_url) == normalize_service_base_url(
+        provider,
+        space_base_url,
+    )
+
+
+def _space_enrichment_token_error_response(exc):
+    if str(exc) != _AMBIGUOUS_GITHUB_TOKEN_ERROR:
+        return None
+
+    return Response(
+        {
+            'error': (
+                'Multiple GitHub tokens match this space. Remove duplicate GitHub tokens '
+                'or set the space Git base URL to the intended GitHub host.'
+            ),
+        },
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+
+def _file_enrichment_error_response(exc):
+    if is_enrichment_configuration_error(exc):
+        message = str(exc)
+        if message.startswith('No service token found for provider: '):
+            provider = message.rsplit(': ', 1)[-1]
+            message = (
+                f'No service token found for provider: {provider}. '
+                'Add a matching service token or include the correct base_url in the source URI.'
+            )
+        return Response({'error': message}, status=status.HTTP_400_BAD_REQUEST)
+    return None
+
+
+def _preflight_file_enrichment_provider_access(source_uri, user, enrichment_type=None):
+    """
+    Resolve provider credentials up front for file requests that may need them.
+
+    This avoids threaded `type=all` fan-out masking deterministic token
+    configuration errors behind sqlite table-lock failures during tests.
+    """
+    address = SourceAddress.parse(source_uri)
+    if address.provider != 'github':
+        return
+    if enrichment_type not in (None, 'pr_diff'):
+        return
+    GitProviderFactory.get_source_service_token(
+        user=user,
+        provider=address.provider,
+        base_url=address.base_url,
+    )
+
+
 def _get_space_enrichments(request, space_slug, start_time):
     """
     Get all enrichments for a space.
@@ -30,19 +104,25 @@ def _get_space_enrichments(request, space_slug, start_time):
     """
     from git_provider.factory import GitProviderFactory
     from service_tokens.models import ServiceToken
+    from source_provider.base import SourceAddress
     from wiki.models import FileComment, UserDraftChange, UserChange
 
     try:
-        space = Space.objects.get(slug=space_slug)
-        repo_id = f"{space.git_project_key}_{space.git_repository_id}"
-        branch = space.git_default_branch or 'master'
+        space = get_accessible_space_or_404(request.user, space_slug)
+        repo_id = GitProviderFactory.build_repository_identity(
+            space.git_provider,
+            space.git_project_key,
+            space.git_repository_id,
+        )
+        branch = space.git_default_branch or GitProviderFactory.default_branch_fallback(space.git_provider)
 
         logger.info(f"[SpaceEnrichments] Space: {space.name}, Provider: {space.git_provider}, Repo: {repo_id}")
 
-        service_token = ServiceToken.objects.filter(
+        service_token = GitProviderFactory.get_service_token(
             user=request.user,
-            service_type=space.git_provider
-        ).first()
+            provider=space.git_provider,
+            base_url=space.git_base_url,
+        )
 
         if not service_token:
             logger.warning(f"[SpaceEnrichments] No service token for {space.git_provider}")
@@ -108,10 +188,13 @@ def _get_space_enrichments(request, space_slug, start_time):
                             })
 
         # ── Comments ──────────────────────────────────────────────────────────
-        source_uri_prefix = f"git://{space.git_provider}/{repo_id}/{branch}/"
+        source_uri_prefixes = [f"git://{space.git_provider}/{repo_id}"]
+        if space.git_provider == 'github' and '/' in repo_id:
+            legacy_repo_id = repo_id.replace('/', '_', 1)
+            source_uri_prefixes.append(f"git://{space.git_provider}/{legacy_repo_id}")
         comments_qs = (
             FileComment.objects
-            .filter(source_uri__startswith=source_uri_prefix, parent_comment=None)
+            .filter(Q(source_uri__startswith=source_uri_prefixes[0]) | Q(source_uri__startswith=source_uri_prefixes[1]) if len(source_uri_prefixes) > 1 else Q(source_uri__startswith=source_uri_prefixes[0]), parent_comment=None)
             .select_related('author')
             .prefetch_related('replies')
             .order_by('line_start', 'created_at')
@@ -137,9 +220,34 @@ def _get_space_enrichments(request, space_slug, start_time):
             return data
 
         for comment in comments_qs:
-            file_path = comment.source_uri[len(source_uri_prefix):]
+            try:
+                comment_address = SourceAddress.parse_for_github_context(
+                    comment.source_uri,
+                    repository=repo_id,
+                    branch=branch,
+                )
+            except ValueError:
+                logger.warning(f"[SpaceEnrichments] Skipping unparseable comment URI: {comment.source_uri}")
+                continue
+
+            if comment_address.provider != space.git_provider:
+                continue
+            if _normalize_comment_repository(comment_address.provider, comment_address.repository) != repo_id:
+                continue
+            if comment_address.branch != branch:
+                continue
+            if not _comment_matches_space_base_url(
+                comment_address.provider,
+                space.git_base_url,
+                comment_address.base_url,
+            ):
+                continue
+
+            file_path = comment_address.path
             _ensure_file(file_enrichments, file_path)
-            file_enrichments[file_path]['comments'].append(_serialize_comment(comment))
+            serialized_comment = _serialize_comment(comment)
+            serialized_comment['source_uri'] = comment_address.to_uri()
+            file_enrichments[file_path]['comments'].append(serialized_comment)
 
         logger.info(f"[SpaceEnrichments] Loaded {comments_qs.count()} comment threads")
 
@@ -270,8 +378,15 @@ def _get_space_enrichments(request, space_slug, start_time):
 
         return Response(file_enrichments)
 
-    except Space.DoesNotExist:
+    except (Space.DoesNotExist, Http404):
         return Response({'error': 'Space not found'}, status=status.HTTP_404_NOT_FOUND)
+    except ValueError as e:
+        token_error = _space_enrichment_token_error_response(e)
+        if token_error is not None:
+            return token_error
+        logger.error(f"[SpaceEnrichments] Failed: {e}")
+        logger.error(traceback.format_exc())
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     except Exception as e:
         logger.error(f"[SpaceEnrichments] Failed: {e}")
         logger.error(traceback.format_exc())
@@ -346,31 +461,17 @@ def _get_recursive_enrichments(request, source_uri, enrichment_type, start_time)
     """
     from source_provider.base import SourceAddress
     from git_provider.factory import GitProviderFactory
-    from service_tokens.models import ServiceToken
     
     try:
-        # Strip trailing slash for root directory
-        original_uri = source_uri
-        source_uri = source_uri.rstrip('/')
-        logger.debug(f"[Enrichments] Original URI: {original_uri}")
-        logger.debug(f"[Enrichments] After rstrip: {source_uri}")
-        logger.debug(f"[Enrichments] Slash count: {source_uri.count('/')}")
-        
-        # For root directory, add a placeholder path for parser
-        # git://provider/repo/branch has 4 slashes (git:// = 2, then 2 more)
-        # git://provider/repo/branch/path has 5+ slashes
-        if source_uri.count('/') == 4:  # No path component (root directory)
-            source_uri += '/.'
-            logger.debug(f"[Enrichments] Added placeholder: {source_uri}")
-        
         # Parse source address to get provider and repository info
-        address = SourceAddress.parse(source_uri)
+        address = SourceAddress.parse(source_uri.rstrip('/'))
         
         # Get Git provider
-        service_token = ServiceToken.objects.filter(
+        service_token = GitProviderFactory.get_source_service_token(
             user=request.user,
-            service_type=address.provider
-        ).first()
+            provider=address.provider,
+            base_url=address.base_url,
+        )
         
         if not service_token:
             return Response(
@@ -382,10 +483,13 @@ def _get_recursive_enrichments(request, source_uri, enrichment_type, start_time)
         
         # Get directory tree recursively to get all files in subdirectories
         tree_start = time.time()
-        # Convert '.' placeholder to empty string for root directory
-        tree_path = '' if address.path == '.' else (address.path or '')
+        tree_path = address.path or ''
         # Split repository into project_key and repo_slug
-        project_key, repo_slug = address.repository.split('_', 1)
+        project_key, repo_slug = GitProviderFactory.get_repository_coordinates(
+            address.provider,
+            None,
+            address.repository,
+        )
         tree_entries = provider.get_directory_tree(project_key, repo_slug, tree_path, address.branch, recursive=True)
         tree_duration = time.time() - tree_start
         logger.info(f"[Enrichments] Recursive tree fetch took {tree_duration:.3f}s, found {len(tree_entries)} entries")
@@ -401,7 +505,13 @@ def _get_recursive_enrichments(request, source_uri, enrichment_type, start_time)
         for file_entry in files:
             file_path = file_entry.get('path', '')
             # Build source URI for this file
-            file_source_uri = f"git://{address.provider}/{address.repository}/{address.branch}/{file_path}"
+            file_source_uri = SourceAddress(
+                provider=address.provider,
+                repository=address.repository,
+                branch=address.branch,
+                path=file_path,
+                base_url=address.base_url,
+            ).to_uri()
             
             try:
                 if enrichment_type:
@@ -410,6 +520,8 @@ def _get_recursive_enrichments(request, source_uri, enrichment_type, start_time)
                 else:
                     enrichments = registry.get_all_enrichments(file_source_uri, request.user)
                     results[file_source_uri] = enrichments
+            except ValueError:
+                raise
             except Exception as e:
                 logger.error(f"[Enrichments] Failed to get enrichments for {file_source_uri}: {e}")
                 results[file_source_uri] = {}
@@ -419,6 +531,12 @@ def _get_recursive_enrichments(request, source_uri, enrichment_type, start_time)
         
         return Response(results)
         
+    except ValueError as e:
+        logger.error(f"[Enrichments] Recursive enrichment failed: {e}")
+        return Response(
+            {'error': str(e)},
+            status=status.HTTP_400_BAD_REQUEST
+        )
     except Exception as e:
         logger.error(f"[Enrichments] Recursive enrichment failed: {e}")
         return Response(
@@ -462,6 +580,14 @@ def get_enrichments(request):
         )
     
     logger.info(f"[Enrichments] File request for: {source_uri} (type: {enrichment_type or 'all'}, recursive: {recursive})")
+
+    try:
+        _preflight_file_enrichment_provider_access(source_uri, request.user, enrichment_type)
+    except ValueError as exc:
+        error_response = _file_enrichment_error_response(exc)
+        if error_response is not None:
+            return error_response
+        raise
     
     # Handle recursive directory enrichments
     if recursive:
@@ -470,17 +596,29 @@ def get_enrichments(request):
     registry = get_registry()
     
     if enrichment_type:
-        # Get enrichments of specific type
-        type_start = time.time()
-        enrichments = registry.get_enrichments_by_type(source_uri, request.user, enrichment_type)
-        type_duration = time.time() - type_start
-        logger.info(f"[Enrichments] Type '{enrichment_type}' took {type_duration:.3f}s")
-        result = {enrichment_type: enrichments}
+        try:
+            # Get enrichments of specific type
+            type_start = time.time()
+            enrichments = registry.get_enrichments_by_type(source_uri, request.user, enrichment_type)
+            type_duration = time.time() - type_start
+            logger.info(f"[Enrichments] Type '{enrichment_type}' took {type_duration:.3f}s")
+            result = {enrichment_type: enrichments}
+        except ValueError as exc:
+            error_response = _file_enrichment_error_response(exc)
+            if error_response is not None:
+                return error_response
+            raise
     else:
-        # Get all enrichments
-        all_start = time.time()
-        enrichments = registry.get_all_enrichments(source_uri, request.user)
-        all_duration = time.time() - all_start
+        try:
+            # Get all enrichments
+            all_start = time.time()
+            enrichments = registry.get_all_enrichments(source_uri, request.user)
+            all_duration = time.time() - all_start
+        except ValueError as exc:
+            error_response = _file_enrichment_error_response(exc)
+            if error_response is not None:
+                return error_response
+            raise
         
         # Log individual provider times
         for enrich_type, enrich_list in enrichments.items():
@@ -539,6 +677,14 @@ def stream_enrichments(request):
         from .comment_enrichment import CommentEnrichmentProvider
         from .edit_session_enrichment import EditEnrichmentProvider, CommitEnrichmentProvider
 
+        try:
+            _preflight_file_enrichment_provider_access(source_uri, request.user, enrichment_type='pr_diff')
+        except ValueError as exc:
+            error_response = _file_enrichment_error_response(exc)
+            message = error_response.data['error'] if error_response is not None else str(exc)
+            yield json.dumps({'type': 'error', 'message': message}) + '\n'
+            return
+
         # Fast enrichments first (DB / local git — typically < 0.5s total).
         yield json.dumps({'type': 'progress', 'message': 'Loading annotations…'}) + '\n'
         comments, edits, commits = [], [], []
@@ -557,13 +703,20 @@ def stream_enrichments(request):
 
         # Slow: stream PR enrichments with per-PR progress events.
         pr_enrichments = []
+        failed_closed = False
         for event in PREnrichmentProvider().get_enrichments_stream(source_uri, request.user):
             if event['type'] == 'result':
                 pr_enrichments = event['data']
             elif event['type'] == 'error':
                 logger.warning(f"[StreamEnrichments] PR stream error: {event.get('message')}")
+                failed_closed = True
+                yield json.dumps(event) + '\n'
+                break
             else:
                 yield json.dumps(event) + '\n'
+
+        if failed_closed:
+            return
 
         # Suppress commit enrichment when the branch already has an open PR
         # (the PR diff is a superset of the commit diff).

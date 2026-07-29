@@ -145,6 +145,27 @@ class TestGitProviderFactory:
         assert isinstance(provider, BitbucketServerProvider)
         assert provider.user == mock_user
 
+    def test_get_repository_coordinates_github_owner_repo(self):
+        """GitHub coordinates should resolve from canonical owner/repo IDs."""
+        project_key, repo_slug = GitProviderFactory.get_repository_coordinates(
+            ServiceType.GITHUB,
+            None,
+            'octo/repo',
+        )
+
+        assert project_key == 'octo'
+        assert repo_slug == 'repo'
+
+    def test_build_repository_identity_github(self):
+        """GitHub repository identities stay in owner/repo form."""
+        repo_id = GitProviderFactory.build_repository_identity(
+            ServiceType.GITHUB,
+            None,
+            'octo/repo',
+        )
+
+        assert repo_id == 'octo/repo'
+
 
 @pytest.mark.django_db
 class TestGitProviderFactoryFromServiceToken:
@@ -170,6 +191,96 @@ class TestGitProviderFactoryFromServiceToken:
         assert isinstance(provider, GitHubProvider)
         assert provider.base_url == 'https://api.github.com'
         assert provider.token == 'ghp_test_token'
+
+    def test_create_from_github_service_token_normalizes_public_web_url(self, user):
+        """A GitHub token stored against github.com should still create an API client."""
+        from service_tokens.models import ServiceToken
+
+        token = ServiceToken.objects.create(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://github.com',
+        )
+        token.set_token('ghp_test_token')
+        token.save()
+
+        provider = GitProviderFactory.create_from_service_token(token)
+
+        assert isinstance(provider, GitHubProvider)
+        assert provider.base_url == 'https://api.github.com'
+
+    def test_get_service_token_matches_github_public_and_api_urls(self, user):
+        """GitHub token lookup should match public repo URLs to API-token rows."""
+        from service_tokens.models import ServiceToken
+
+        token = ServiceToken.objects.create(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://api.github.com',
+        )
+        token.set_token('ghp_test_token')
+        token.save()
+
+        service_token = GitProviderFactory.get_service_token(
+            user=user,
+            provider=ServiceType.GITHUB,
+            base_url='https://github.com',
+        )
+
+        assert service_token == token
+
+    def test_get_service_token_fails_closed_when_github_url_candidates_miss(self, user):
+        """GitHub token lookup must not fall back to an arbitrary token row."""
+        from service_tokens.models import ServiceToken
+
+        matched_token = ServiceToken.objects.create(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://ghe.example.com/api/v3',
+        )
+        matched_token.set_token('ghe-token')
+        matched_token.save()
+
+        other_token = ServiceToken.objects.create(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://api.github.com',
+        )
+        other_token.set_token('public-token')
+        other_token.save()
+
+        service_token = GitProviderFactory.get_service_token(
+            user=user,
+            provider=ServiceType.GITHUB,
+            base_url='https://another.example.com',
+        )
+
+        assert service_token is None
+
+    def test_get_service_token_fails_closed_for_semantically_duplicate_ghe_tokens(self, user):
+        """Root and /api/v3 GitHub Enterprise rows must not resolve arbitrarily."""
+        from service_tokens.models import ServiceToken
+
+        first_token = ServiceToken(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://ghe.example.com',
+            encrypted_token='first-encrypted',
+        )
+        second_token = ServiceToken(
+            user=user,
+            service_type=ServiceType.GITHUB,
+            base_url='https://ghe.example.com/api/v3',
+            encrypted_token='second-encrypted',
+        )
+        ServiceToken.objects.bulk_create([first_token, second_token])
+
+        with pytest.raises(ValueError, match='Ambiguous service token configuration for provider: github'):
+            GitProviderFactory.get_service_token(
+                user=user,
+                provider=ServiceType.GITHUB,
+                base_url='https://ghe.example.com',
+            )
     
     def test_create_from_bitbucket_service_token_without_custom_header(self, user):
         """Test creating Bitbucket provider from ServiceToken without custom header."""
@@ -213,7 +324,8 @@ class TestGitProviderFactoryFromServiceToken:
             user=user,
             service_type=ServiceType.CUSTOM_HEADER,
             header_name='X-ZTA-Token',
-            name='ZTA Token'
+            name='ZTA Token',
+            base_url='',
         )
         custom_token.set_token('zta_token_value')
         custom_token.save()
@@ -266,6 +378,24 @@ class TestGitProviderFactoryFromServiceToken:
         
         assert 'X-First-Token' in provider.headers
         assert provider.headers['X-First-Token'] == 'first_token'
+
+    def test_get_custom_header_token_does_not_fall_back_to_unrelated_base_url(self, user):
+        from service_tokens.models import ServiceToken
+
+        custom_token = ServiceToken.objects.create(
+            user=user,
+            service_type=ServiceType.CUSTOM_HEADER,
+            header_name='X-Other-Token',
+            name='Other Token',
+            base_url='https://another.example.com'
+        )
+        custom_token.set_token('other-token')
+        custom_token.save()
+
+        assert GitProviderFactory.get_custom_header_token(
+            user,
+            base_url='https://bitbucket.example.com',
+        ) is None
     
     def test_create_from_service_token_handles_custom_header_error(self, user):
         """Test that custom header lookup errors are handled gracefully."""
